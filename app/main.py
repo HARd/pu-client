@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -265,7 +266,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PlayUA Desktop Client")
-        self.resize(1100, 700)
+        self.resize(1240, 780)
 
         self.client = BackblazeB2Client()
         self.settings_store = SettingsStore()
@@ -284,16 +285,32 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
+        main.setContentsMargins(18, 14, 18, 14)
+        main.setSpacing(10)
 
         self.title_label = QLabel("PlayUA Desktop Client")
         self.title_label.setObjectName("titleLabel")
         main.addWidget(self.title_label)
-        self.subtitle_label = QLabel("Upload files/folders, monitor progress, and manage direct links in one place.")
+        self.subtitle_label = QLabel("Upload files and folders, track progress, and manage direct links in one app.")
         self.subtitle_label.setObjectName("subtitleLabel")
         main.addWidget(self.subtitle_label)
 
-        grid = QGridLayout()
-        main.addLayout(grid)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        main.addLayout(body, 1)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
+        body.addLayout(left_col, 4)
+        body.addLayout(right_col, 6)
+
+        connection_group = QGroupBox("Backblaze Connection")
+        left_col.addWidget(connection_group)
+        grid = QGridLayout(connection_group)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
 
         self.key_id_input = QLineEdit()
         self.app_key_input = QLineEdit()
@@ -323,7 +340,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.remember_check, 3, 0, 1, 2)
 
         row1 = QHBoxLayout()
-        main.addLayout(row1)
+        row1.setSpacing(8)
+        left_col.addLayout(row1)
 
         self.save_btn = QPushButton("Save Settings")
         self.auth_btn = QPushButton("Authorize")
@@ -342,7 +360,8 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.refresh_btn)
 
         row2 = QHBoxLayout()
-        main.addLayout(row2)
+        row2.setSpacing(8)
+        right_col.addLayout(row2)
 
         self.copy_public_btn = QPushButton("Copy Public Link")
         self.open_public_btn = QPushButton("Open Public Link")
@@ -354,31 +373,17 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.copy_private_btn)
         row2.addWidget(self.open_private_btn)
 
+        queue_group = QGroupBox("Upload Queue")
+        left_col.addWidget(queue_group, 1)
+        queue_layout = QVBoxLayout(queue_group)
+        queue_layout.setSpacing(8)
+
         self.upload_selection_label = QLabel("No files selected")
-        main.addWidget(self.upload_selection_label)
+        queue_layout.addWidget(self.upload_selection_label)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["File Name", "Size (bytes)", "Uploaded (UTC)"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        main.addWidget(self.table)
-
-        self.status_label = QLabel("Ready")
-        main.addWidget(self.status_label)
-        self.progress_label = QLabel("Idle")
-        main.addWidget(self.progress_label)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        main.addWidget(self.progress_bar)
-
-        self.queue_hint_label = QLabel("Upload queue preview")
+        self.queue_hint_label = QLabel("Items that will be uploaded")
         self.queue_hint_label.setObjectName("sectionLabel")
-        main.addWidget(self.queue_hint_label)
+        queue_layout.addWidget(self.queue_hint_label)
 
         self.queue_table = QTableWidget(0, 2)
         self.queue_table.setHorizontalHeaderLabels(["Target Path in Bucket", "Size"])
@@ -387,12 +392,43 @@ class MainWindow(QMainWindow):
         self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.queue_table.setSelectionMode(QAbstractItemView.MultiSelection)
         self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        main.addWidget(self.queue_table)
+        self.queue_table.setAlternatingRowColors(True)
+        queue_layout.addWidget(self.queue_table, 1)
 
         queue_actions = QHBoxLayout()
-        main.addLayout(queue_actions)
         self.remove_selected_btn = QPushButton("Remove Selected From Queue")
         queue_actions.addWidget(self.remove_selected_btn)
+        queue_layout.addLayout(queue_actions)
+
+        files_group = QGroupBox("Files In Bucket")
+        right_col.addWidget(files_group, 1)
+        files_layout = QVBoxLayout(files_group)
+        files_layout.setSpacing(8)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["File Name", "Size", "Uploaded (UTC)"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        files_layout.addWidget(self.table, 1)
+
+        progress_group = QGroupBox("Current Operation")
+        main.addWidget(progress_group)
+        progress_layout = QVBoxLayout(progress_group)
+        progress_layout.setSpacing(6)
+
+        self.status_label = QLabel("Ready")
+        progress_layout.addWidget(self.status_label)
+        self.progress_label = QLabel("Idle")
+        progress_layout.addWidget(self.progress_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        progress_layout.addWidget(self.progress_bar)
 
         self.save_btn.clicked.connect(self.save_settings)
         self.auth_btn.clicked.connect(self.authorize)
@@ -408,15 +444,100 @@ class MainWindow(QMainWindow):
         self.remove_selected_btn.clicked.connect(self.remove_selected_upload_items)
 
     def _set_human_friendly_defaults(self) -> None:
+        self.auth_btn.setObjectName("primaryBtn")
+        self.upload_btn.setObjectName("primaryBtn")
+        self.refresh_btn.setObjectName("secondaryBtn")
+        self.copy_public_btn.setObjectName("secondaryBtn")
+        self.open_public_btn.setObjectName("secondaryBtn")
+        self.copy_private_btn.setObjectName("secondaryBtn")
+        self.open_private_btn.setObjectName("secondaryBtn")
+        self.remove_selected_btn.setObjectName("dangerBtn")
+
         self.setStyleSheet(
             """
-            QWidget { font-size: 13px; }
-            #titleLabel { font-size: 22px; font-weight: 700; margin-bottom: 2px; }
-            #subtitleLabel { color: #5f6368; margin-bottom: 8px; }
-            #sectionLabel { font-weight: 600; margin-top: 8px; }
-            QLineEdit { padding: 6px; }
-            QPushButton { padding: 7px 10px; }
-            QProgressBar { min-height: 18px; }
+            QWidget { font-size: 13px; color: #1f2937; }
+            QMainWindow, QWidget { background: #f5f7fb; }
+            #titleLabel { font-size: 24px; font-weight: 700; margin-bottom: 2px; color: #0f172a; }
+            #subtitleLabel { color: #64748b; margin-bottom: 8px; }
+            #sectionLabel { font-weight: 600; color: #475569; }
+            QGroupBox {
+              border: 1px solid #dbe3f0;
+              border-radius: 12px;
+              margin-top: 8px;
+              background: white;
+              font-weight: 600;
+              padding-top: 12px;
+            }
+            QGroupBox::title {
+              subcontrol-origin: margin;
+              left: 10px;
+              padding: 0 6px 0 6px;
+              color: #0f172a;
+              background: white;
+            }
+            QLineEdit {
+              padding: 7px 9px;
+              border: 1px solid #cbd5e1;
+              border-radius: 8px;
+              background: #ffffff;
+            }
+            QLineEdit:focus { border: 1px solid #2563eb; }
+            QPushButton {
+              padding: 7px 12px;
+              border-radius: 8px;
+              border: 1px solid #cbd5e1;
+              background: #ffffff;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            QPushButton#primaryBtn {
+              background: #2563eb;
+              border: 1px solid #1d4ed8;
+              color: white;
+              font-weight: 600;
+            }
+            QPushButton#primaryBtn:hover { background: #1d4ed8; }
+            QPushButton#secondaryBtn {
+              background: #0f766e;
+              border: 1px solid #0f766e;
+              color: white;
+              font-weight: 600;
+            }
+            QPushButton#secondaryBtn:hover { background: #0d635c; }
+            QPushButton#dangerBtn {
+              background: #fef2f2;
+              color: #b91c1c;
+              border: 1px solid #fecaca;
+            }
+            QPushButton:disabled {
+              color: #9ca3af;
+              background: #f1f5f9;
+              border: 1px solid #e2e8f0;
+            }
+            QTableWidget {
+              border: 1px solid #e2e8f0;
+              border-radius: 8px;
+              gridline-color: #eef2f7;
+              background: #ffffff;
+              alternate-background-color: #f8fafc;
+            }
+            QHeaderView::section {
+              background: #f1f5f9;
+              border: 0;
+              border-bottom: 1px solid #e2e8f0;
+              padding: 6px;
+              font-weight: 600;
+            }
+            QProgressBar {
+              min-height: 18px;
+              border: 1px solid #cbd5e1;
+              border-radius: 8px;
+              background: #eef2ff;
+              text-align: center;
+            }
+            QProgressBar::chunk {
+              border-radius: 8px;
+              background: #2563eb;
+            }
             """
         )
 
@@ -741,15 +862,28 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             file_name = row.get("fileName", "")
-            size = row.get("size", 0)
+            size = self._extract_file_size(row)
             upload_ts = row.get("uploadTimestamp")
             uploaded = ""
             if upload_ts:
                 uploaded = dt.datetime.fromtimestamp(upload_ts / 1000, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            self.table.setItem(i, 0, QTableWidgetItem(file_name))
-            self.table.setItem(i, 1, QTableWidgetItem(str(size)))
-            self.table.setItem(i, 2, QTableWidgetItem(uploaded))
+            name_item = QTableWidgetItem(file_name)
+            size_item = QTableWidgetItem(format_bytes(size))
+            size_item.setToolTip(f"{size} bytes")
+            uploaded_item = QTableWidgetItem(uploaded)
+
+            self.table.setItem(i, 0, name_item)
+            self.table.setItem(i, 1, size_item)
+            self.table.setItem(i, 2, uploaded_item)
+
+    def _extract_file_size(self, row: Dict) -> int:
+        # B2 may return size as `size` (list_file_names) or `contentLength` (versions/other APIs).
+        raw = row.get("size", row.get("contentLength", 0))
+        try:
+            return int(raw)
+        except Exception:
+            return 0
 
     def _selected_file_name(self) -> Optional[str]:
         row = self.table.currentRow()
