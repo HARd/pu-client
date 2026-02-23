@@ -17,19 +17,6 @@
 ## Вимоги
 - Python 3.9+
 
-## Встановлення
-```bash
-cd /Users/Erleke/Documents/dev/rozetka/backblaze
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
-```
-
-## Запуск
-```bash
-python /Users/Erleke/Documents/dev/rozetka/backblaze/app/main.py
-```
 
 ## Налаштування
 Settings файл:
