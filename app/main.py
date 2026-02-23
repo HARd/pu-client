@@ -275,10 +275,11 @@ class MainWindow(QMainWindow):
         self.file_rows = []
         self.selected_upload_items: List[Tuple[str, str, int]] = []
         self._workers = []
+        self.theme_mode = "dark"
 
         self._build_ui()
-        self._load_settings()
         self._set_human_friendly_defaults()
+        self._load_settings()
         self._refresh_queue_table()
 
     def _build_ui(self) -> None:
@@ -321,6 +322,8 @@ class MainWindow(QMainWindow):
         self.ttl_input = QLineEdit("3600")
         self.remember_check = QCheckBox("Remember settings (includes key)")
         self.remember_check.setChecked(True)
+        self.dark_theme_check = QCheckBox("Dark theme")
+        self.dark_theme_check.setChecked(True)
 
         grid.addWidget(QLabel("Application Key ID"), 0, 0)
         grid.addWidget(self.key_id_input, 0, 1)
@@ -338,6 +341,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.ttl_input, 2, 3)
 
         grid.addWidget(self.remember_check, 3, 0, 1, 2)
+        grid.addWidget(self.dark_theme_check, 3, 2, 1, 2)
 
         row1 = QHBoxLayout()
         row1.setSpacing(8)
@@ -442,6 +446,7 @@ class MainWindow(QMainWindow):
         self.copy_private_btn.clicked.connect(self.copy_private_link)
         self.open_private_btn.clicked.connect(self.open_private_link)
         self.remove_selected_btn.clicked.connect(self.remove_selected_upload_items)
+        self.dark_theme_check.toggled.connect(self._on_theme_toggled)
 
     def _set_human_friendly_defaults(self) -> None:
         self.auth_btn.setObjectName("primaryBtn")
@@ -453,18 +458,115 @@ class MainWindow(QMainWindow):
         self.open_private_btn.setObjectName("secondaryBtn")
         self.remove_selected_btn.setObjectName("dangerBtn")
 
+        self._apply_theme("dark")
+
+    def _apply_theme(self, theme: str) -> None:
+        self.theme_mode = theme
+        if theme == "light":
+            self.setStyleSheet(
+                """
+                QWidget { font-size: 13px; color: #1f2937; }
+                QMainWindow, QWidget { background: #f5f7fb; }
+                #titleLabel { font-size: 24px; font-weight: 700; margin-bottom: 2px; color: #0f172a; }
+                #subtitleLabel { color: #64748b; margin-bottom: 8px; }
+                #sectionLabel { font-weight: 600; color: #475569; }
+                QGroupBox {
+                  border: 1px solid #dbe3f0;
+                  border-radius: 12px;
+                  margin-top: 8px;
+                  background: white;
+                  font-weight: 600;
+                  padding-top: 12px;
+                }
+                QGroupBox::title {
+                  subcontrol-origin: margin;
+                  left: 10px;
+                  padding: 0 6px 0 6px;
+                  color: #0f172a;
+                  background: white;
+                }
+                QLineEdit {
+                  padding: 7px 9px;
+                  border: 1px solid #cbd5e1;
+                  border-radius: 8px;
+                  background: #ffffff;
+                }
+                QLineEdit:focus { border: 1px solid #60a5fa; }
+                QPushButton {
+                  padding: 7px 12px;
+                  border-radius: 8px;
+                  border: 1px solid #cbd5e1;
+                  background: #ffffff;
+                }
+                QPushButton:hover { background: #f8fafc; }
+                QPushButton#primaryBtn {
+                  background: #2563eb;
+                  border: 1px solid #2563eb;
+                  color: white;
+                  font-weight: 600;
+                }
+                QPushButton#primaryBtn:hover { background: #1e4fd8; }
+                QPushButton#secondaryBtn {
+                  background: #0f766e;
+                  border: 1px solid #0f766e;
+                  color: white;
+                  font-weight: 600;
+                }
+                QPushButton#secondaryBtn:hover { background: #0d635c; }
+                QPushButton#dangerBtn {
+                  background: #fef2f2;
+                  color: #b91c1c;
+                  border: 1px solid #fecaca;
+                }
+                QPushButton:disabled {
+                  color: #9ca3af;
+                  background: #f1f5f9;
+                  border: 1px solid #e2e8f0;
+                }
+                QTableWidget {
+                  border: 1px solid #e2e8f0;
+                  border-radius: 8px;
+                  gridline-color: #eef2f7;
+                  background: #ffffff;
+                  color: #1f2937;
+                  alternate-background-color: #f8fafc;
+                }
+                QHeaderView::section {
+                  background: #f1f5f9;
+                  border: 0;
+                  border-bottom: 1px solid #e2e8f0;
+                  padding: 6px;
+                  font-weight: 600;
+                  color: #334155;
+                }
+                QProgressBar {
+                  min-height: 18px;
+                  border: 1px solid #cbd5e1;
+                  border-radius: 8px;
+                  background: #eef2ff;
+                  text-align: center;
+                  color: #334155;
+                }
+                QProgressBar::chunk {
+                  border-radius: 8px;
+                  background: #3b82f6;
+                }
+                """
+            )
+            return
+
         self.setStyleSheet(
             """
-            QWidget { font-size: 13px; color: #1f2937; }
-            QMainWindow, QWidget { background: #f5f7fb; }
-            #titleLabel { font-size: 24px; font-weight: 700; margin-bottom: 2px; color: #0f172a; }
-            #subtitleLabel { color: #64748b; margin-bottom: 8px; }
-            #sectionLabel { font-weight: 600; color: #475569; }
+            QWidget { font-size: 13px; color: #e5e7eb; }
+            QMainWindow, QWidget { background: #0b0b0d; }
+            #titleLabel { font-size: 24px; font-weight: 700; margin-bottom: 2px; color: #f8fafc; }
+            #subtitleLabel { color: #9ca3af; margin-bottom: 8px; }
+            #sectionLabel { font-weight: 600; color: #cbd5e1; }
             QGroupBox {
-              border: 1px solid #dbe3f0;
+              border: 1px solid #2a2a2f;
               border-radius: 12px;
               margin-top: 8px;
-              background: white;
+              background: #141418;
               font-weight: 600;
               padding-top: 12px;
             }
@@ -472,30 +574,32 @@ class MainWindow(QMainWindow):
               subcontrol-origin: margin;
               left: 10px;
               padding: 0 6px 0 6px;
-              color: #0f172a;
-              background: white;
+              color: #f3f4f6;
+              background: #141418;
             }
             QLineEdit {
               padding: 7px 9px;
-              border: 1px solid #cbd5e1;
+              border: 1px solid #34343c;
               border-radius: 8px;
-              background: #ffffff;
+              background: #111318;
+              color: #f3f4f6;
             }
-            QLineEdit:focus { border: 1px solid #2563eb; }
+            QLineEdit:focus { border: 1px solid #60a5fa; }
             QPushButton {
               padding: 7px 12px;
               border-radius: 8px;
-              border: 1px solid #cbd5e1;
-              background: #ffffff;
+              border: 1px solid #3f3f46;
+              background: #1b1b21;
+              color: #e5e7eb;
             }
-            QPushButton:hover { background: #f8fafc; }
+            QPushButton:hover { background: #23232b; }
             QPushButton#primaryBtn {
               background: #2563eb;
-              border: 1px solid #1d4ed8;
+              border: 1px solid #2563eb;
               color: white;
               font-weight: 600;
             }
-            QPushButton#primaryBtn:hover { background: #1d4ed8; }
+            QPushButton#primaryBtn:hover { background: #1e4fd8; }
             QPushButton#secondaryBtn {
               background: #0f766e;
               border: 1px solid #0f766e;
@@ -504,42 +608,48 @@ class MainWindow(QMainWindow):
             }
             QPushButton#secondaryBtn:hover { background: #0d635c; }
             QPushButton#dangerBtn {
-              background: #fef2f2;
-              color: #b91c1c;
-              border: 1px solid #fecaca;
+              background: #3a1113;
+              color: #fecaca;
+              border: 1px solid #7f1d1d;
             }
             QPushButton:disabled {
-              color: #9ca3af;
-              background: #f1f5f9;
-              border: 1px solid #e2e8f0;
+              color: #6b7280;
+              background: #16161b;
+              border: 1px solid #2a2a2f;
             }
             QTableWidget {
-              border: 1px solid #e2e8f0;
+              border: 1px solid #2f2f37;
               border-radius: 8px;
-              gridline-color: #eef2f7;
-              background: #ffffff;
-              alternate-background-color: #f8fafc;
+              gridline-color: #26262e;
+              background: #101217;
+              color: #e5e7eb;
+              alternate-background-color: #161923;
             }
             QHeaderView::section {
-              background: #f1f5f9;
+              background: #1c1f2a;
               border: 0;
-              border-bottom: 1px solid #e2e8f0;
+              border-bottom: 1px solid #2f2f37;
               padding: 6px;
               font-weight: 600;
+              color: #f3f4f6;
             }
             QProgressBar {
               min-height: 18px;
-              border: 1px solid #cbd5e1;
+              border: 1px solid #2f2f37;
               border-radius: 8px;
-              background: #eef2ff;
+              background: #141722;
               text-align: center;
+              color: #e5e7eb;
             }
             QProgressBar::chunk {
               border-radius: 8px;
-              background: #2563eb;
+              background: #3b82f6;
             }
             """
         )
+
+    def _on_theme_toggled(self, checked: bool) -> None:
+        self._apply_theme("dark" if checked else "light")
 
         self.key_id_input.setPlaceholderText("e.g. 004a7f3f...")
         self.app_key_input.setPlaceholderText("Application Key")
@@ -565,6 +675,7 @@ class MainWindow(QMainWindow):
             self.select_folder_btn,
             self.clear_selection_btn,
             self.remove_selected_btn,
+            self.dark_theme_check,
             self.upload_btn,
             self.refresh_btn,
             self.copy_public_btn,
@@ -655,6 +766,13 @@ class MainWindow(QMainWindow):
         self.prefix_input.setText(data.get("prefix", ""))
         self.ttl_input.setText(str(data.get("private_ttl", 3600)))
         self.remember_check.setChecked(bool(data.get("remember", True)))
+        theme = str(data.get("theme", "dark")).lower()
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        self.dark_theme_check.blockSignals(True)
+        self.dark_theme_check.setChecked(theme == "dark")
+        self.dark_theme_check.blockSignals(False)
+        self._apply_theme(theme)
 
     def save_settings(self) -> None:
         cfg = self._current_config()
@@ -666,6 +784,7 @@ class MainWindow(QMainWindow):
             "prefix": cfg["prefix"],
             "private_ttl": self._private_ttl(),
             "remember": cfg["remember"],
+            "theme": "dark" if self.dark_theme_check.isChecked() else "light",
         }
         self.settings_store.save(payload)
         self.set_status(f"Settings saved: {self.settings_store.path}")
