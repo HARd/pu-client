@@ -59,7 +59,7 @@ jobs:
           Compress-Archive -Path dist\playua-desktop-client\* -DestinationPath playua-desktop-client-windows.zip -Force
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: playua-desktop-client-${{ runner.os }}
           path: |
