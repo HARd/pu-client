@@ -42,10 +42,21 @@ fi
 
 rm -rf build dist
 
+if ! "$PYTHON_BIN" scripts/prepare_icons.py; then
+  echo "Failed to prepare app icons."
+  exit 1
+fi
+
+ICON_ARG=()
+if [[ -f "build/icons/app-icon.icns" ]]; then
+  ICON_ARG=(--icon "build/icons/app-icon.icns")
+fi
+
 "$PYTHON_BIN" -m PyInstaller \
   --name playua-desktop-client \
   --windowed \
   --noconfirm \
+  "${ICON_ARG[@]}" \
   app/main.py
 
 echo

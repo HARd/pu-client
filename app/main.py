@@ -165,6 +165,36 @@ class BackblazeB2Client:
         data = response.json()
         return data.get("files", [])
 
+    def list_files_all(self, bucket_id: str, prefix: str = "", max_count: int = 1000) -> List[Dict]:
+        self._require_auth()
+        all_files: List[Dict] = []
+        next_file_name = None
+
+        while True:
+            payload = {
+                "bucketId": bucket_id,
+                "maxFileCount": max_count,
+            }
+            if prefix:
+                payload["prefix"] = prefix
+            if next_file_name:
+                payload["startFileName"] = next_file_name
+
+            response = requests.post(
+                f"{self.api_url}/b2api/v2/b2_list_file_names",
+                headers={"Authorization": self.authorization_token},
+                json=payload,
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            all_files.extend(data.get("files", []))
+            next_file_name = data.get("nextFileName")
+            if not next_file_name:
+                break
+
+        return all_files
+
     def get_download_authorization(self, bucket_id: str, file_name: str, valid_seconds: int) -> str:
         self._require_auth()
 
@@ -191,6 +221,42 @@ class BackblazeB2Client:
         if auth_token:
             return f"{url}?{urlencode({'Authorization': auth_token})}"
         return url
+
+    def download_file(
+        self,
+        bucket_name: str,
+        file_name: str,
+        target_path: str,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
+        self._require_auth()
+        url = self.make_direct_url(bucket_name, file_name)
+        headers = {"Authorization": self.authorization_token}
+
+        response = requests.get(url, headers=headers, stream=True, timeout=120)
+        if response.status_code >= 400:
+            try:
+                details = response.json()
+            except Exception:
+                details = response.text
+            raise RuntimeError(f"Download failed ({response.status_code}): {details}")
+
+        total = int(response.headers.get("Content-Length", "0"))
+        downloaded = 0
+        chunk_size = 1024 * 256
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb:
+                    progress_cb(downloaded, total)
+
+        if progress_cb:
+            progress_cb(downloaded, total)
 
 
 class UploadProgressReader:
@@ -371,11 +437,15 @@ class MainWindow(QMainWindow):
         self.open_public_btn = QPushButton("Open Public Link")
         self.copy_private_btn = QPushButton("Copy Private Link")
         self.open_private_btn = QPushButton("Open Private Link")
+        self.download_selected_btn = QPushButton("Download Selected")
+        self.download_folder_btn = QPushButton("Download Folder")
 
         row2.addWidget(self.copy_public_btn)
         row2.addWidget(self.open_public_btn)
         row2.addWidget(self.copy_private_btn)
         row2.addWidget(self.open_private_btn)
+        row2.addWidget(self.download_selected_btn)
+        row2.addWidget(self.download_folder_btn)
 
         queue_group = QGroupBox("Upload Queue")
         left_col.addWidget(queue_group, 1)
@@ -415,7 +485,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         files_layout.addWidget(self.table, 1)
@@ -445,6 +515,8 @@ class MainWindow(QMainWindow):
         self.open_public_btn.clicked.connect(self.open_public_link)
         self.copy_private_btn.clicked.connect(self.copy_private_link)
         self.open_private_btn.clicked.connect(self.open_private_link)
+        self.download_selected_btn.clicked.connect(self.download_selected_files)
+        self.download_folder_btn.clicked.connect(self.download_folder_by_prefix)
         self.remove_selected_btn.clicked.connect(self.remove_selected_upload_items)
         self.dark_theme_check.toggled.connect(self._on_theme_toggled)
 
@@ -456,7 +528,10 @@ class MainWindow(QMainWindow):
         self.open_public_btn.setObjectName("secondaryBtn")
         self.copy_private_btn.setObjectName("secondaryBtn")
         self.open_private_btn.setObjectName("secondaryBtn")
+        self.download_selected_btn.setObjectName("secondaryBtn")
+        self.download_folder_btn.setObjectName("secondaryBtn")
         self.remove_selected_btn.setObjectName("dangerBtn")
+        self._configure_hints()
 
         self._apply_theme("dark")
 
@@ -651,6 +726,7 @@ class MainWindow(QMainWindow):
     def _on_theme_toggled(self, checked: bool) -> None:
         self._apply_theme("dark" if checked else "light")
 
+    def _configure_hints(self) -> None:
         self.key_id_input.setPlaceholderText("e.g. 004a7f3f...")
         self.app_key_input.setPlaceholderText("Application Key")
         self.bucket_id_input.setPlaceholderText("Bucket ID")
@@ -663,6 +739,8 @@ class MainWindow(QMainWindow):
         self.upload_btn.setToolTip("Start uploading all queued items.")
         self.clear_selection_btn.setToolTip("Clear the whole upload queue.")
         self.remove_selected_btn.setToolTip("Remove selected rows from upload queue preview.")
+        self.download_selected_btn.setToolTip("Download selected files from bucket to a local folder.")
+        self.download_folder_btn.setToolTip("Download all files by prefix from bucket.")
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -682,6 +760,8 @@ class MainWindow(QMainWindow):
             self.open_public_btn,
             self.copy_private_btn,
             self.open_private_btn,
+            self.download_selected_btn,
+            self.download_folder_btn,
         ]
         for w in controls:
             w.setEnabled(not busy)
@@ -1013,6 +1093,15 @@ class MainWindow(QMainWindow):
             return None
         return item.text()
 
+    def _selected_file_names(self) -> List[str]:
+        rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
+        result: List[str] = []
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item and item.text():
+                result.append(item.text())
+        return result
+
     def _copy_text(self, text: str) -> None:
         QApplication.clipboard().setText(text)
 
@@ -1108,6 +1197,127 @@ class MainWindow(QMainWindow):
             self.set_status("Private link opened")
 
         self._run_bg(task, done)
+
+    def _download_batch(self, cfg: Dict, file_names: List[str], destination_root: str) -> None:
+        total_files = len(file_names)
+        total_expected = 0
+        for name in file_names:
+            row = next((r for r in self.file_rows if r.get("fileName") == name), None)
+            if row:
+                total_expected += self._extract_file_size(row)
+
+        self.set_status(f"Downloading {total_files} file(s)...")
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Preparing download...")
+
+        def task(progress):
+            self._ensure_authorized(cfg)
+            downloaded_done = 0
+
+            for idx, file_name in enumerate(file_names, start=1):
+                target_path = os.path.join(destination_root, file_name.replace("/", os.sep))
+                file_label = os.path.basename(file_name) or file_name
+
+                progress(
+                    int((downloaded_done * 100) / max(1, total_expected)) if total_expected > 0 else 0,
+                    f"[{idx}/{total_files}] Downloading {file_label}...",
+                )
+
+                def on_file_progress(current: int, total: int) -> None:
+                    if total_expected > 0 and total > 0:
+                        global_current = downloaded_done + current
+                        pct = int((global_current * 100) / max(1, total_expected))
+                        progress(
+                            pct,
+                            f"[{idx}/{total_files}] "
+                            f"{format_bytes(global_current)} / {format_bytes(total_expected)} downloaded, "
+                            f"left {format_bytes(max(0, total_expected - global_current))}",
+                        )
+                    else:
+                        progress(0, f"[{idx}/{total_files}] Downloading {file_label}...")
+
+                self.client.download_file(
+                    cfg["bucket_name"],
+                    file_name,
+                    target_path,
+                    progress_cb=on_file_progress,
+                )
+
+                file_size = 0
+                try:
+                    file_size = os.path.getsize(target_path)
+                except Exception:
+                    pass
+                downloaded_done += file_size
+
+            progress(100, "Download completed")
+            return None
+
+        def done(_: object) -> None:
+            self.set_status("Download completed")
+            self.progress_label.setText("Download completed")
+            self.progress_bar.setValue(100)
+            QMessageBox.information(self, "Downloaded", f"Downloaded {total_files} file(s).")
+
+        def on_progress(pct: int, text: str) -> None:
+            self.progress_bar.setValue(max(0, min(100, pct)))
+            self.progress_label.setText(text)
+
+        self._run_bg(task, done, on_progress)
+
+    def download_selected_files(self) -> None:
+        cfg = self._current_config()
+        if not cfg["bucket_name"]:
+            QMessageBox.warning(self, "Missing data", "Bucket Name is required.")
+            return
+
+        selected = self._selected_file_names()
+        if not selected:
+            QMessageBox.warning(self, "No selection", "Select one or more files in the bucket table.")
+            return
+
+        destination = QFileDialog.getExistingDirectory(self, "Select destination folder")
+        if not destination:
+            return
+
+        self._download_batch(cfg, selected, destination)
+
+    def download_folder_by_prefix(self) -> None:
+        cfg = self._current_config()
+        if not cfg["bucket_name"] or not cfg["bucket_id"]:
+            QMessageBox.warning(self, "Missing data", "Bucket ID and Bucket Name are required.")
+            return
+
+        prefix = cfg["prefix"].strip()
+        if not prefix:
+            QMessageBox.warning(self, "Missing prefix", "Set folder prefix in the Prefix field (e.g. media/2026/).")
+            return
+
+        destination = QFileDialog.getExistingDirectory(self, "Select destination folder for folder download")
+        if not destination:
+            return
+
+        self.set_status("Loading folder file list...")
+        self.progress_label.setText("Loading folder file list...")
+        self.progress_bar.setValue(0)
+
+        def task(progress):
+            self._ensure_authorized(cfg)
+            files = self.client.list_files_all(cfg["bucket_id"], prefix=prefix)
+            names = [f.get("fileName", "") for f in files if f.get("fileName")]
+            if not names:
+                raise RuntimeError(f"No files found for prefix: {prefix}")
+            progress(5, f"Found {len(names)} file(s). Starting download...")
+            return names
+
+        def done(file_names: object) -> None:
+            self._download_batch(cfg, list(file_names), destination)
+
+        def on_progress(pct: int, text: str) -> None:
+            self.progress_bar.setValue(max(0, min(100, pct)))
+            self.progress_label.setText(text)
+
+        self._run_bg(task, done, on_progress)
 
 
 def run() -> None:

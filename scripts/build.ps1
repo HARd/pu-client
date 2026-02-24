@@ -35,19 +35,25 @@ if (-not $?) {
 if (Test-Path build) { Remove-Item build -Recurse -Force }
 if (Test-Path dist) { Remove-Item dist -Recurse -Force }
 
-if ($PythonBin -eq "py") {
-  py -m PyInstaller `
-    --name playua-desktop-client `
-    --windowed `
-    --noconfirm `
-    app/main.py
-} else {
-  python -m PyInstaller `
-    --name playua-desktop-client `
-    --windowed `
-    --noconfirm `
-    app/main.py
+if ($PythonBin -eq "py") { & py scripts/prepare_icons.py } else { & python scripts/prepare_icons.py }
+if (-not $?) {
+  Write-Host "Failed to prepare app icons."
+  exit 1
 }
+
+$IconPath = Join-Path $RootDir "build\\icons\\app-icon.ico"
+$PyArgs = @(
+  "-m", "PyInstaller",
+  "--name", "playua-desktop-client",
+  "--windowed",
+  "--noconfirm"
+)
+if (Test-Path $IconPath) {
+  $PyArgs += @("--icon", $IconPath)
+}
+$PyArgs += "app/main.py"
+
+if ($PythonBin -eq "py") { & py @PyArgs } else { & python @PyArgs }
 
 Write-Host ""
 Write-Host "Build finished. Output in: $RootDir/dist"
