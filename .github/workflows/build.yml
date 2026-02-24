@@ -6,8 +6,6 @@ on:
     branches:
       - main
       - master
-    tags:
-      - "v*"
   pull_request:
 
 jobs:
@@ -69,7 +67,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -81,27 +79,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine release tag
+      - name: Determine next version tag
         id: tag
         shell: bash
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG_NAME="${GITHUB_REF#refs/tags/}"
-            PRERELEASE="false"
+          LATEST_TAG="$(git tag -l 'v*' --sort=-version:refname | head -n1)"
+          if [[ -z "${LATEST_TAG}" ]]; then
+            MAJOR=0
+            MINOR=1
+            PATCH=0
           else
-            TAG_NAME="auto-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
-            PRERELEASE="true"
+            VERSION="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${VERSION}"
+            MAJOR="${MAJOR:-0}"
+            MINOR="${MINOR:-1}"
+            PATCH="${PATCH:-0}"
           fi
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push auto tag (branch pushes)
-        if: startsWith(github.ref, 'refs/heads/')
+          NEXT_PATCH=$((PATCH + 1))
+          TAG_NAME="v${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+          while git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null 2>&1; do
+            NEXT_PATCH=$((NEXT_PATCH + 1))
+            TAG_NAME="v${MAJOR}.${MINOR}.${NEXT_PATCH}"
+          done
+
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push version tag
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.tag.outputs.tag_name }}"
+          git tag -a "${{ steps.tag.outputs.tag_name }}" -m "Release ${{ steps.tag.outputs.tag_name }}"
           git push origin "${{ steps.tag.outputs.tag_name }}"
 
       - name: Download artifacts
@@ -114,50 +124,10 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           target_commitish: ${{ github.sha }}
-          prerelease: ${{ steps.tag.outputs.prerelease }}
+          prerelease: false
           generate_release_notes: true
           files: |
             release-assets/**/playua-desktop-client-macos.zip
             release-assets/**/playua-desktop-client-windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cleanup old auto releases (keep latest 4)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            const releases = await github.paginate(github.rest.repos.listReleases, {
-              owner,
-              repo,
-              per_page: 100,
-            });
-
-            const autoReleases = releases
-              .filter(r => r.tag_name && r.tag_name.startsWith("auto-"))
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-            const toDelete = autoReleases.slice(4);
-            core.info(`Auto releases found: ${autoReleases.length}. Deleting: ${toDelete.length}`);
-
-            for (const rel of toDelete) {
-              core.info(`Deleting release ${rel.id} (${rel.tag_name})`);
-              await github.rest.repos.deleteRelease({
-                owner,
-                repo,
-                release_id: rel.id,
-              });
-
-              try {
-                await github.rest.git.deleteRef({
-                  owner,
-                  repo,
-                  ref: `tags/${rel.tag_name}`,
-                });
-                core.info(`Deleted tag ${rel.tag_name}`);
-              } catch (err) {
-                core.warning(`Failed to delete tag ${rel.tag_name}: ${err.message}`);
-              }
-            }
