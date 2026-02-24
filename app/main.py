@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -12,13 +13,16 @@ from urllib.parse import quote, urlencode
 
 import requests
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtGui import QKeySequence
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -29,8 +33,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QMenu,
+    QInputDialog,
     QPushButton,
     QProgressBar,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -39,6 +45,10 @@ from PySide6.QtWidgets import (
     QWidget,
     QSplitter,
 )
+
+
+APP_VERSION = "0.1.0"
+DEFAULT_UPDATE_REPO = "Erleke/backblaze"
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -51,6 +61,14 @@ def format_bytes(num_bytes: int) -> str:
     if unit_idx == 0:
         return f"{int(value)} {units[unit_idx]}"
     return f"{value:.2f} {units[unit_idx]}"
+
+
+def parse_semver(tag: str) -> Tuple[int, int, int]:
+    raw = tag.strip().lstrip("v")
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", raw)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
 class BackblazeB2Client:
@@ -389,6 +407,108 @@ class WorkerSignals(QObject):
     progress = Signal(int, str)
 
 
+class PreviewDialog(QDialog):
+    def __init__(self, parent: QWidget, file_name: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Preview: {file_name}")
+        self.resize(980, 640)
+        self.original_pixmap: Optional[QPixmap] = None
+
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel("Loading preview...")
+        layout.addWidget(self.status_label)
+
+        self.image_label = QLabel("")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumHeight(420)
+        layout.addWidget(self.image_label, 1)
+
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(420)
+        self.video_widget.setVisible(False)
+        layout.addWidget(self.video_widget, 1)
+
+        controls = QHBoxLayout()
+        self.play_btn = QPushButton("Play")
+        self.pause_btn = QPushButton("Pause")
+        self.stop_btn = QPushButton("Stop")
+        self.seek = QSlider(Qt.Horizontal)
+        self.seek.setRange(0, 0)
+        self.seek.setEnabled(False)
+        controls.addWidget(self.play_btn)
+        controls.addWidget(self.pause_btn)
+        controls.addWidget(self.stop_btn)
+        controls.addWidget(self.seek, 1)
+        layout.addLayout(controls)
+
+        self.audio_output = QAudioOutput()
+        self.player = QMediaPlayer()
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+
+        self.play_btn.clicked.connect(self.player.play)
+        self.pause_btn.clicked.connect(self.player.pause)
+        self.stop_btn.clicked.connect(self.player.stop)
+        self.seek.sliderMoved.connect(self.player.setPosition)
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.errorOccurred.connect(self._on_error)
+
+        self.play_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+
+    def _on_position_changed(self, pos: int) -> None:
+        if not self.seek.isSliderDown():
+            self.seek.setValue(pos)
+
+    def _on_duration_changed(self, duration: int) -> None:
+        self.seek.setRange(0, max(0, duration))
+
+    def _on_error(self, _error) -> None:
+        self.status_label.setText(f"Playback error: {self.player.errorString() or 'Unknown error'}")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.original_pixmap and self.image_label.isVisible():
+            scaled = self.original_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.image_label.setPixmap(scaled)
+
+    def closeEvent(self, event) -> None:
+        self.player.stop()
+        super().closeEvent(event)
+
+    def show_image(self, file_name: str, data: bytes) -> None:
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            self.status_label.setText("Failed to decode image.")
+            return
+        self.original_pixmap = pix
+        self.video_widget.setVisible(False)
+        self.image_label.setVisible(True)
+        scaled = pix.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setPixmap(scaled)
+        self.status_label.setText(f"Image preview: {file_name}")
+        self.seek.setEnabled(False)
+        self.play_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+
+    def show_media(self, file_name: str, media_url: str, is_video: bool) -> None:
+        self.original_pixmap = None
+        self.image_label.clear()
+        self.image_label.setVisible(False)
+        self.video_widget.setVisible(is_video)
+        self.seek.setEnabled(True)
+        self.play_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.player.setSource(QUrl(media_url))
+        self.player.play()
+        label = "Video" if is_video else "Audio"
+        self.status_label.setText(f"{label} preview: {file_name}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -411,6 +531,10 @@ class MainWindow(QMainWindow):
         self.transfer_stop = threading.Event()
         self.transfer_active = False
         self.transfer_background = False
+        self.profiles: Dict[str, Dict] = {}
+        self.active_profile_name = "Default"
+        self.update_repo = DEFAULT_UPDATE_REPO
+        self._preview_windows: List[PreviewDialog] = []
 
         self._build_ui()
         self._set_human_friendly_defaults()
@@ -431,6 +555,9 @@ class MainWindow(QMainWindow):
         self.subtitle_label = QLabel("Upload files and folders, track progress, and manage direct links in one app.")
         self.subtitle_label.setObjectName("subtitleLabel")
         main.addWidget(self.subtitle_label)
+        self.version_label = QLabel(f"Version {APP_VERSION}")
+        self.version_label.setObjectName("subtitleLabel")
+        main.addWidget(self.version_label)
 
         body_splitter = QSplitter(Qt.Horizontal)
         main.addWidget(body_splitter, 1)
@@ -467,6 +594,9 @@ class MainWindow(QMainWindow):
         self.remember_check.setChecked(True)
         self.dark_theme_check = QCheckBox("Dark theme")
         self.dark_theme_check.setChecked(True)
+        self.profile_combo = QComboBox()
+        self.profile_save_btn = QPushButton("Save Profile")
+        self.profile_delete_btn = QPushButton("Delete Profile")
 
         grid.addWidget(QLabel("Application Key ID"), 0, 0)
         grid.addWidget(self.key_id_input, 0, 1)
@@ -485,6 +615,12 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self.remember_check, 3, 0, 1, 2)
         grid.addWidget(self.dark_theme_check, 3, 2, 1, 2)
+        grid.addWidget(QLabel("Profile"), 4, 0)
+        grid.addWidget(self.profile_combo, 4, 1)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_save_btn)
+        profile_row.addWidget(self.profile_delete_btn)
+        grid.addLayout(profile_row, 4, 2, 1, 2)
 
         row1 = QHBoxLayout()
         row1.setSpacing(8)
@@ -583,11 +719,12 @@ class MainWindow(QMainWindow):
         filters_row.addWidget(self.refresh_btn)
         files_layout.addLayout(filters_row)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["File Name", "Size", "Uploaded (UTC)"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["File Name", "Size", "Uploaded (UTC)", "Preview"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -666,6 +803,9 @@ class MainWindow(QMainWindow):
         self.download_folder_btn.clicked.connect(self.download_folder_by_prefix)
         self.remove_selected_btn.clicked.connect(self.remove_selected_upload_items)
         self.dark_theme_check.toggled.connect(self._on_theme_toggled)
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        self.profile_save_btn.clicked.connect(self.save_profile)
+        self.profile_delete_btn.clicked.connect(self.delete_profile)
         self.search_input.textChanged.connect(self._apply_filters)
         self.type_filter.currentIndexChanged.connect(self._apply_filters)
         self.size_filter.currentIndexChanged.connect(self._apply_filters)
@@ -693,6 +833,8 @@ class MainWindow(QMainWindow):
         self.download_selected_btn.setObjectName("secondaryBtn")
         self.download_folder_btn.setObjectName("secondaryBtn")
         self.remove_selected_btn.setObjectName("dangerBtn")
+        self.profile_save_btn.setObjectName("secondaryBtn")
+        self.profile_delete_btn.setObjectName("dangerBtn")
         self._configure_hints()
         self._polish_tables()
         self.resume_btn.setEnabled(False)
@@ -1147,6 +1289,8 @@ class MainWindow(QMainWindow):
         self.resume_btn.setToolTip("Resume paused transfer.")
         self.stop_btn.setToolTip("Stop current transfer.")
         self.sync_btn.setToolTip("Choose local folder and upload missing/changed files into selected prefix.")
+        self.profile_save_btn.setToolTip("Save current connection fields into selected profile.")
+        self.profile_delete_btn.setToolTip("Delete selected profile.")
 
     def _polish_tables(self) -> None:
         sortable = [self.table, self.history_table]
@@ -1178,6 +1322,9 @@ class MainWindow(QMainWindow):
         self.more_clear_queue_action = QAction("Clear Queue", self)
         self.more_download_folder_action = QAction("Download Folder by Prefix", self)
         self.more_sync_action = QAction("Sync Folder -> Prefix", self)
+        self.more_check_updates_action = QAction("Check for Updates", self)
+        self.more_set_update_repo_action = QAction("Set Update Repo", self)
+        self.more_profile_new_action = QAction("Create Profile", self)
         self.more_pause_action = QAction("Pause Transfer", self)
         self.more_resume_action = QAction("Resume Transfer", self)
         self.more_stop_action = QAction("Stop Transfer", self)
@@ -1193,6 +1340,11 @@ class MainWindow(QMainWindow):
         menu.addAction(self.more_download_folder_action)
         menu.addAction(self.more_sync_action)
         menu.addSeparator()
+        menu.addAction(self.more_profile_new_action)
+        menu.addSeparator()
+        menu.addAction(self.more_check_updates_action)
+        menu.addAction(self.more_set_update_repo_action)
+        menu.addSeparator()
         menu.addAction(self.more_pause_action)
         menu.addAction(self.more_resume_action)
         menu.addAction(self.more_stop_action)
@@ -1205,6 +1357,9 @@ class MainWindow(QMainWindow):
         self.more_clear_queue_action.triggered.connect(self.clear_upload_selection)
         self.more_download_folder_action.triggered.connect(self.download_folder_by_prefix)
         self.more_sync_action.triggered.connect(self.sync_folder_to_prefix)
+        self.more_check_updates_action.triggered.connect(self.check_for_updates)
+        self.more_set_update_repo_action.triggered.connect(self.set_update_repo)
+        self.more_profile_new_action.triggered.connect(self.create_profile)
         self.more_pause_action.triggered.connect(self.pause_transfer)
         self.more_resume_action.triggered.connect(self.resume_transfer)
         self.more_stop_action.triggered.connect(self.stop_transfer)
@@ -1219,6 +1374,7 @@ class MainWindow(QMainWindow):
         self.more_resume_action.setEnabled(self.transfer_active and self.transfer_pause.is_set())
         self.more_stop_action.setEnabled(self.transfer_active)
         self.more_background_action.setChecked(self.background_check.isChecked())
+        self.more_profile_new_action.setEnabled(True)
 
     def _select_row_at_context(self, table: QTableWidget, pos) -> None:
         item = table.itemAt(pos)
@@ -1248,11 +1404,12 @@ class MainWindow(QMainWindow):
         act_open_public = menu.addAction("Open Public Link")
         act_copy_private = menu.addAction("Copy Private Link")
         act_open_private = menu.addAction("Open Private Link")
+        act_preview = menu.addAction("Preview Selected")
         menu.addSeparator()
         act_download = menu.addAction("Download Selected")
         act_refresh = menu.addAction("Refresh List")
 
-        for action in [act_copy_public, act_open_public, act_copy_private, act_open_private, act_download]:
+        for action in [act_copy_public, act_open_public, act_copy_private, act_open_private, act_preview, act_download]:
             action.setEnabled(has_selection)
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -1264,6 +1421,8 @@ class MainWindow(QMainWindow):
             self.copy_private_link()
         elif chosen == act_open_private:
             self.open_private_link()
+        elif chosen == act_preview:
+            self.preview_selected_file()
         elif chosen == act_download:
             self.download_selected_files()
         elif chosen == act_refresh:
@@ -1302,6 +1461,88 @@ class MainWindow(QMainWindow):
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
+    def _profile_payload_from_fields(self) -> Dict:
+        return {
+            "key_id": self.key_id_input.text().strip(),
+            "app_key": self.app_key_input.text().strip(),
+            "bucket_id": self.bucket_id_input.text().strip(),
+            "bucket_name": self.bucket_name_input.text().strip(),
+            "prefix": self.prefix_input.text().strip(),
+            "private_ttl": self.ttl_input.text().strip() or "3600",
+        }
+
+    def _apply_profile_payload(self, payload: Dict) -> None:
+        self.key_id_input.setText(str(payload.get("key_id", "")))
+        self.app_key_input.setText(str(payload.get("app_key", "")))
+        self.bucket_id_input.setText(str(payload.get("bucket_id", "")))
+        self.bucket_name_input.setText(str(payload.get("bucket_name", "")))
+        self.prefix_input.setText(str(payload.get("prefix", "")))
+        self.ttl_input.setText(str(payload.get("private_ttl", "3600")))
+
+    def _refresh_profile_combo(self) -> None:
+        names = sorted(self.profiles.keys())
+        if not names:
+            self.profiles["Default"] = self._profile_payload_from_fields()
+            names = ["Default"]
+        if self.active_profile_name not in self.profiles:
+            self.active_profile_name = names[0]
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItems(names)
+        self.profile_combo.setCurrentText(self.active_profile_name)
+        self.profile_combo.blockSignals(False)
+
+    def _on_profile_changed(self, name: str) -> None:
+        if not name or name not in self.profiles:
+            return
+        self.active_profile_name = name
+        self._apply_profile_payload(self.profiles[name])
+        self.set_status(f"Profile loaded: {name}")
+
+    def create_profile(self) -> None:
+        name, ok = QInputDialog.getText(self, "Create Profile", "Profile name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Profile", "Profile name cannot be empty.")
+            return
+        if name in self.profiles:
+            QMessageBox.warning(self, "Profile", f"Profile already exists: {name}")
+            return
+        self.profiles[name] = self._profile_payload_from_fields()
+        self.active_profile_name = name
+        self._refresh_profile_combo()
+        self.save_settings()
+        self.set_status(f"Profile created: {name}")
+
+    def save_profile(self) -> None:
+        name = self.profile_combo.currentText().strip()
+        if not name:
+            name = "Default"
+        self.profiles[name] = self._profile_payload_from_fields()
+        self.active_profile_name = name
+        self._refresh_profile_combo()
+        self.save_settings()
+        self.set_status(f"Profile saved: {name}")
+
+    def delete_profile(self) -> None:
+        name = self.profile_combo.currentText().strip()
+        if not name:
+            return
+        if name == "Default":
+            QMessageBox.warning(self, "Profile", "Default profile cannot be deleted.")
+            return
+        if name in self.profiles:
+            del self.profiles[name]
+        if not self.profiles:
+            self.profiles["Default"] = self._profile_payload_from_fields()
+        self.active_profile_name = sorted(self.profiles.keys())[0]
+        self._refresh_profile_combo()
+        self._apply_profile_payload(self.profiles[self.active_profile_name])
+        self.save_settings()
+        self.set_status(f"Profile deleted: {name}")
+
     def _set_busy(self, busy: bool) -> None:
         if self.transfer_background and self.transfer_active:
             self.pause_btn.setEnabled(self.transfer_active and not self.transfer_pause.is_set())
@@ -1316,6 +1557,9 @@ class MainWindow(QMainWindow):
             self.clear_selection_btn,
             self.download_btn,
             self.more_btn,
+            self.profile_combo,
+            self.profile_save_btn,
+            self.profile_delete_btn,
             self.remove_selected_btn,
             self.dark_theme_check,
             self.upload_btn,
@@ -1421,14 +1665,24 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> None:
         data = self.settings_store.load()
-        self.key_id_input.setText(data.get("key_id", ""))
-        self.app_key_input.setText(data.get("app_key", ""))
-        self.bucket_id_input.setText(data.get("bucket_id", ""))
-        self.bucket_name_input.setText(data.get("bucket_name", ""))
-        self.prefix_input.setText(data.get("prefix", ""))
-        self.ttl_input.setText(str(data.get("private_ttl", 3600)))
+        self.update_repo = str(data.get("update_repo", DEFAULT_UPDATE_REPO))
         self.remember_check.setChecked(bool(data.get("remember", True)))
         self.background_check.setChecked(bool(data.get("background", False)))
+        self.profiles = dict(data.get("profiles", {})) if isinstance(data.get("profiles", {}), dict) else {}
+        if not self.profiles:
+            self.profiles = {
+                "Default": {
+                    "key_id": str(data.get("key_id", "")),
+                    "app_key": str(data.get("app_key", "")),
+                    "bucket_id": str(data.get("bucket_id", "")),
+                    "bucket_name": str(data.get("bucket_name", "")),
+                    "prefix": str(data.get("prefix", "")),
+                    "private_ttl": str(data.get("private_ttl", 3600)),
+                }
+            }
+        self.active_profile_name = str(data.get("active_profile", "Default"))
+        self._refresh_profile_combo()
+        self._apply_profile_payload(self.profiles.get(self.active_profile_name, self.profiles["Default"]))
         theme = str(data.get("theme", "dark")).lower()
         if theme not in ("dark", "light"):
             theme = "dark"
@@ -1439,6 +1693,9 @@ class MainWindow(QMainWindow):
 
     def save_settings(self) -> None:
         cfg = self._current_config()
+        profile_name = self.profile_combo.currentText().strip() or "Default"
+        self.profiles[profile_name] = self._profile_payload_from_fields()
+        self.active_profile_name = profile_name
         payload = {
             "key_id": cfg["key_id"],
             "app_key": cfg["app_key"] if cfg["remember"] else "",
@@ -1449,6 +1706,9 @@ class MainWindow(QMainWindow):
             "remember": cfg["remember"],
             "theme": "dark" if self.dark_theme_check.isChecked() else "light",
             "background": cfg["background"],
+            "profiles": self.profiles,
+            "active_profile": self.active_profile_name,
+            "update_repo": self.update_repo,
         }
         self.settings_store.save(payload)
         self.set_status(f"Settings saved: {self.settings_store.path}")
@@ -1726,6 +1986,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 0, name_item)
             self.table.setItem(i, 1, size_item)
             self.table.setItem(i, 2, uploaded_item)
+            self.table.setCellWidget(i, 3, self._new_table_preview_button(file_name))
         self.set_status(f"Loaded {len(self.filtered_rows)} file(s) (filtered)")
 
     def _extract_file_size(self, row: Dict) -> int:
@@ -1756,6 +2017,137 @@ class MainWindow(QMainWindow):
 
     def _copy_text(self, text: str) -> None:
         QApplication.clipboard().setText(text)
+
+    def _selected_file_row(self) -> Optional[Dict]:
+        file_name = self._selected_file_name()
+        if not file_name:
+            return None
+        return next((r for r in self.filtered_rows if r.get("fileName") == file_name), None)
+
+    def set_update_repo(self) -> None:
+        value, ok = QInputDialog.getText(
+            self,
+            "Set Update Repo",
+            "GitHub repo (owner/name):",
+            text=self.update_repo,
+        )
+        if not ok:
+            return
+        value = value.strip()
+        if not re.match(r"^[^/\s]+/[^/\s]+$", value):
+            QMessageBox.warning(self, "Update repo", "Format must be owner/name.")
+            return
+        self.update_repo = value
+        self.save_settings()
+        self.set_status(f"Update repo set: {value}")
+
+    def check_for_updates(self) -> None:
+        repo = self.update_repo.strip() or DEFAULT_UPDATE_REPO
+        self.set_status("Checking updates...")
+
+        def task():
+            url = f"https://api.github.com/repos/{repo}/releases/latest"
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            tag = str(data.get("tag_name", ""))
+            html_url = str(data.get("html_url", ""))
+            name = str(data.get("name", tag))
+            return {"repo": repo, "tag": tag, "url": html_url, "name": name}
+
+        def done(result: object) -> None:
+            info = dict(result)
+            latest_tag = str(info.get("tag", ""))
+            latest_ver = parse_semver(latest_tag)
+            current_ver = parse_semver(APP_VERSION)
+            if latest_ver > current_ver and info.get("url"):
+                answer = QMessageBox.question(
+                    self,
+                    "Update available",
+                    f"Current: v{APP_VERSION}\nLatest: {latest_tag}\n\nOpen release page?",
+                )
+                if answer == QMessageBox.Yes:
+                    QDesktopServices.openUrl(QUrl(str(info["url"])))
+                self.set_status(f"Update available: {latest_tag}")
+                return
+            QMessageBox.information(
+                self,
+                "Updates",
+                f"You are up to date.\nCurrent: v{APP_VERSION}\nLatest: {latest_tag or 'unknown'}",
+            )
+            self.set_status("No updates found")
+
+        self._run_bg(task, done)
+
+    def _build_preview_url(self, cfg: Dict, file_name: str) -> str:
+        # QMediaPlayer can't inject auth headers reliably, so use temporary signed URL if possible.
+        if cfg.get("bucket_id"):
+            ttl = 3600
+            try:
+                ttl = self._private_ttl()
+            except Exception:
+                ttl = 3600
+            token = self.client.get_download_authorization(cfg["bucket_id"], file_name, ttl)
+            return self.client.make_direct_url(cfg["bucket_name"], file_name, auth_token=token)
+        return self.client.make_direct_url(cfg["bucket_name"], file_name)
+
+    def _new_table_preview_button(self, file_name: str) -> QPushButton:
+        btn = QPushButton("Preview")
+        btn.setObjectName("secondaryBtn")
+        btn.clicked.connect(lambda _=False, name=file_name: self._open_preview_dialog_for_file(name))
+        return btn
+
+    def _open_preview_dialog_for_file(self, file_name: str) -> None:
+        cfg = self._current_config()
+        if not cfg["bucket_name"]:
+            QMessageBox.warning(self, "Preview", "Bucket Name is required.")
+            return
+
+        ext = Path(file_name).suffix.lower()
+        image_ext = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+        video_ext = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+        audio_ext = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
+        media_ext = image_ext | video_ext | audio_ext
+
+        if ext not in media_ext:
+            QMessageBox.information(self, "Preview", f"Preview is not supported for {ext or 'this file type'}.")
+            return
+
+        dialog = PreviewDialog(self, file_name)
+        self._preview_windows.append(dialog)
+        dialog.destroyed.connect(lambda: self._preview_windows.remove(dialog) if dialog in self._preview_windows else None)
+        dialog.show()
+
+        def task():
+            self._ensure_authorized(cfg)
+            url = self._build_preview_url(cfg, file_name)
+            if ext in image_ext:
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                return {"kind": "image", "data": resp.content, "name": file_name}
+            if ext in video_ext:
+                return {"kind": "video", "url": url, "name": file_name}
+            return {"kind": "audio", "url": url, "name": file_name}
+
+        def done(result: object) -> None:
+            info = dict(result)
+            kind = str(info.get("kind", ""))
+            if kind == "image":
+                dialog.show_image(str(info.get("name", "")), bytes(info.get("data", b"")))
+                return
+            if kind == "video":
+                dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=True)
+                return
+            dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=False)
+
+        self._run_bg(task, done)
+
+    def preview_selected_file(self) -> None:
+        file_name = self._selected_file_name()
+        if not file_name:
+            QMessageBox.warning(self, "Preview", "Select a file in the Files tab.")
+            return
+        self._open_preview_dialog_for_file(file_name)
 
     def _public_link_task(self, cfg: Dict, file_name: str) -> str:
         self._ensure_authorized(cfg)
