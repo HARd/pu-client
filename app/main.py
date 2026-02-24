@@ -6,16 +6,19 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import requests
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -25,12 +28,16 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QProgressBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QSplitter,
 )
 
 
@@ -91,13 +98,15 @@ class BackblazeB2Client:
         local_path: str,
         file_name_in_bucket: str,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        wait_if_paused: Optional[Callable[[], None]] = None,
     ) -> dict:
         upload_info = self.get_upload_url(bucket_id)
         upload_url = upload_info["uploadUrl"]
         upload_auth_token = upload_info["authorizationToken"]
 
         total_size = os.path.getsize(local_path)
-        sha1 = self._compute_file_sha1(local_path, total_size, progress_cb)
+        sha1 = self._compute_file_sha1(local_path, total_size, progress_cb, should_stop, wait_if_paused)
 
         headers = {
             "Authorization": upload_auth_token,
@@ -108,7 +117,7 @@ class BackblazeB2Client:
         }
 
         with open(local_path, "rb") as f:
-            stream = UploadProgressReader(f, total_size, progress_cb)
+            stream = UploadProgressReader(f, total_size, progress_cb, should_stop, wait_if_paused)
             response = requests.post(upload_url, headers=headers, data=stream, timeout=120)
 
         if response.status_code >= 400:
@@ -125,6 +134,8 @@ class BackblazeB2Client:
         local_path: str,
         total_size: int,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        wait_if_paused: Optional[Callable[[], None]] = None,
     ) -> str:
         hasher = hashlib.sha1()
         processed = 0
@@ -135,6 +146,10 @@ class BackblazeB2Client:
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
+                if should_stop and should_stop():
+                    raise RuntimeError("Transfer stopped by user.")
+                if wait_if_paused:
+                    wait_if_paused()
                 hasher.update(chunk)
                 processed += len(chunk)
                 if progress_cb:
@@ -228,6 +243,8 @@ class BackblazeB2Client:
         file_name: str,
         target_path: str,
         progress_cb: Optional[Callable[[int, int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        wait_if_paused: Optional[Callable[[], None]] = None,
     ) -> None:
         self._require_auth()
         url = self.make_direct_url(bucket_name, file_name)
@@ -250,6 +267,10 @@ class BackblazeB2Client:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
+                if should_stop and should_stop():
+                    raise RuntimeError("Transfer stopped by user.")
+                if wait_if_paused:
+                    wait_if_paused()
                 f.write(chunk)
                 downloaded += len(chunk)
                 if progress_cb:
@@ -265,11 +286,15 @@ class UploadProgressReader:
         file_obj,
         total_size: int,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        wait_if_paused: Optional[Callable[[], None]] = None,
     ) -> None:
         self.file_obj = file_obj
         self.total_size = total_size
         self.sent = 0
         self.progress_cb = progress_cb
+        self.should_stop = should_stop
+        self.wait_if_paused = wait_if_paused
 
     def __len__(self) -> int:
         return self.total_size
@@ -283,6 +308,10 @@ class UploadProgressReader:
         return pos
 
     def read(self, amt: int = -1) -> bytes:
+        if self.should_stop and self.should_stop():
+            raise RuntimeError("Transfer stopped by user.")
+        if self.wait_if_paused:
+            self.wait_if_paused()
         chunk = self.file_obj.read(amt)
         if not chunk:
             if self.progress_cb:
@@ -322,6 +351,38 @@ class SettingsStore:
         self.path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+class HistoryStore:
+    def __init__(self, settings_store: SettingsStore) -> None:
+        self.path = settings_store.path.parent / "history.jsonl"
+        self._lock = threading.Lock()
+
+    def append(self, action: str, status: str, details: str, bytes_count: int = 0) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "action": action,
+            "status": status,
+            "details": details,
+            "bytes": int(max(0, bytes_count)),
+        }
+        line = json.dumps(row, ensure_ascii=True)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def tail(self, max_rows: int = 300) -> List[Dict]:
+        if not self.path.exists():
+            return []
+        lines = self.path.read_text(encoding="utf-8").splitlines()[-max_rows:]
+        rows: List[Dict] = []
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        return rows
+
+
 class WorkerSignals(QObject):
     success = Signal(object)
     error = Signal(str)
@@ -333,20 +394,29 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("PlayUA Desktop Client")
         self.resize(1240, 780)
+        self.setAcceptDrops(True)
 
         self.client = BackblazeB2Client()
         self.settings_store = SettingsStore()
+        self.history_store = HistoryStore(self.settings_store)
         self.last_auth_key = None
 
         self.file_rows = []
+        self.filtered_rows = []
+        self.share_rows: List[Dict] = []
         self.selected_upload_items: List[Tuple[str, str, int]] = []
         self._workers = []
         self.theme_mode = "dark"
+        self.transfer_pause = threading.Event()
+        self.transfer_stop = threading.Event()
+        self.transfer_active = False
+        self.transfer_background = False
 
         self._build_ui()
         self._set_human_friendly_defaults()
         self._load_settings()
         self._refresh_queue_table()
+        self._refresh_history_table()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -362,16 +432,23 @@ class MainWindow(QMainWindow):
         self.subtitle_label.setObjectName("subtitleLabel")
         main.addWidget(self.subtitle_label)
 
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        main.addLayout(body, 1)
+        body_splitter = QSplitter(Qt.Horizontal)
+        main.addWidget(body_splitter, 1)
 
-        left_col = QVBoxLayout()
+        left_panel = QWidget()
+        left_col = QVBoxLayout(left_panel)
+        left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(10)
-        right_col = QVBoxLayout()
+
+        right_panel = QWidget()
+        right_col = QVBoxLayout(right_panel)
+        right_col.setContentsMargins(0, 0, 0, 0)
         right_col.setSpacing(10)
-        body.addLayout(left_col, 4)
-        body.addLayout(right_col, 6)
+
+        body_splitter.addWidget(left_panel)
+        body_splitter.addWidget(right_panel)
+        body_splitter.setStretchFactor(0, 4)
+        body_splitter.setStretchFactor(1, 6)
 
         connection_group = QGroupBox("Backblaze Connection")
         left_col.addWidget(connection_group)
@@ -419,19 +496,22 @@ class MainWindow(QMainWindow):
         self.select_folder_btn = QPushButton("Select Folder")
         self.clear_selection_btn = QPushButton("Clear Selection")
         self.upload_btn = QPushButton("Upload")
-        self.refresh_btn = QPushButton("Refresh File List")
+        self.download_btn = QPushButton("Download")
+        self.refresh_btn = QPushButton("Refresh")
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More")
+        self.more_btn.setPopupMode(QToolButton.InstantPopup)
+        self.sync_btn = QPushButton("Sync Folder -> Prefix")
+        self.pause_btn = QPushButton("Pause")
+        self.resume_btn = QPushButton("Resume")
+        self.stop_btn = QPushButton("Stop")
+        self.background_check = QCheckBox("Background transfers")
 
-        row1.addWidget(self.save_btn)
         row1.addWidget(self.auth_btn)
-        row1.addWidget(self.select_files_btn)
-        row1.addWidget(self.select_folder_btn)
-        row1.addWidget(self.clear_selection_btn)
         row1.addWidget(self.upload_btn)
-        row1.addWidget(self.refresh_btn)
-
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        right_col.addLayout(row2)
+        row1.addWidget(self.download_btn)
+        row1.addWidget(self.more_btn)
+        row1.addStretch(1)
 
         self.copy_public_btn = QPushButton("Copy Public Link")
         self.open_public_btn = QPushButton("Open Public Link")
@@ -440,12 +520,20 @@ class MainWindow(QMainWindow):
         self.download_selected_btn = QPushButton("Download Selected")
         self.download_folder_btn = QPushButton("Download Folder")
 
-        row2.addWidget(self.copy_public_btn)
-        row2.addWidget(self.open_public_btn)
-        row2.addWidget(self.copy_private_btn)
-        row2.addWidget(self.open_private_btn)
-        row2.addWidget(self.download_selected_btn)
-        row2.addWidget(self.download_folder_btn)
+        self.save_btn.setVisible(False)
+        self.select_files_btn.setVisible(False)
+        self.select_folder_btn.setVisible(False)
+        self.copy_public_btn.setVisible(False)
+        self.open_public_btn.setVisible(False)
+        self.copy_private_btn.setVisible(False)
+        self.open_private_btn.setVisible(False)
+        self.download_selected_btn.setVisible(False)
+        self.download_folder_btn.setVisible(False)
+        self.sync_btn.setVisible(False)
+        self.pause_btn.setVisible(False)
+        self.resume_btn.setVisible(False)
+        self.stop_btn.setVisible(False)
+        self.background_check.setVisible(False)
 
         queue_group = QGroupBox("Upload Queue")
         left_col.addWidget(queue_group, 1)
@@ -474,10 +562,26 @@ class MainWindow(QMainWindow):
         queue_actions.addWidget(self.remove_selected_btn)
         queue_layout.addLayout(queue_actions)
 
+        right_tabs = QTabWidget()
+        right_col.addWidget(right_tabs, 1)
+
         files_group = QGroupBox("Files In Bucket")
-        right_col.addWidget(files_group, 1)
         files_layout = QVBoxLayout(files_group)
         files_layout.setSpacing(8)
+
+        filters_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search file name...")
+        self.type_filter = QComboBox()
+        self.type_filter.addItems(["All types", "Images", "Video", "Audio", "Documents", "Archives"])
+        self.size_filter = QComboBox()
+        self.size_filter.addItems(["Any size", "< 10 MB", "10-100 MB", "100 MB - 1 GB", "> 1 GB"])
+        filters_row.addWidget(self.search_input, 2)
+        filters_row.addWidget(self.type_filter, 1)
+        filters_row.addWidget(self.size_filter, 1)
+        filters_row.addStretch(1)
+        filters_row.addWidget(self.refresh_btn)
+        files_layout.addLayout(filters_row)
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["File Name", "Size", "Uploaded (UTC)"])
@@ -489,6 +593,44 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         files_layout.addWidget(self.table, 1)
+        right_tabs.addTab(files_group, "Files")
+
+        shares_group = QGroupBox("Share Manager")
+        shares_layout = QVBoxLayout(shares_group)
+        self.share_table = QTableWidget(0, 5)
+        self.share_table.setHorizontalHeaderLabels(["File", "Type", "Created (UTC)", "Expires", "URL"])
+        self.share_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.share_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.share_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.share_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.share_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.share_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.share_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.share_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.share_table.setAlternatingRowColors(True)
+        shares_layout.addWidget(self.share_table)
+
+        share_actions = QHBoxLayout()
+        self.copy_share_btn = QPushButton("Copy Selected Share URL")
+        self.open_share_btn = QPushButton("Open Selected Share URL")
+        share_actions.addWidget(self.copy_share_btn)
+        share_actions.addWidget(self.open_share_btn)
+        shares_layout.addLayout(share_actions)
+        right_tabs.addTab(shares_group, "Shares")
+
+        history_group = QGroupBox("Transfer History")
+        history_layout = QVBoxLayout(history_group)
+        self.history_table = QTableWidget(0, 5)
+        self.history_table.setHorizontalHeaderLabels(["Time (UTC)", "Action", "Status", "Size", "Details"])
+        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.history_table.setAlternatingRowColors(True)
+        history_layout.addWidget(self.history_table)
+        right_tabs.addTab(history_group, "History")
 
         progress_group = QGroupBox("Current Operation")
         main.addWidget(progress_group)
@@ -510,7 +652,12 @@ class MainWindow(QMainWindow):
         self.select_folder_btn.clicked.connect(self.select_folder)
         self.clear_selection_btn.clicked.connect(self.clear_upload_selection)
         self.upload_btn.clicked.connect(self.upload_selected_file)
+        self.download_btn.clicked.connect(self.download_selected_files)
         self.refresh_btn.clicked.connect(self.refresh_files)
+        self.sync_btn.clicked.connect(self.sync_folder_to_prefix)
+        self.pause_btn.clicked.connect(self.pause_transfer)
+        self.resume_btn.clicked.connect(self.resume_transfer)
+        self.stop_btn.clicked.connect(self.stop_transfer)
         self.copy_public_btn.clicked.connect(self.copy_public_link)
         self.open_public_btn.clicked.connect(self.open_public_link)
         self.copy_private_btn.clicked.connect(self.copy_private_link)
@@ -519,11 +666,26 @@ class MainWindow(QMainWindow):
         self.download_folder_btn.clicked.connect(self.download_folder_by_prefix)
         self.remove_selected_btn.clicked.connect(self.remove_selected_upload_items)
         self.dark_theme_check.toggled.connect(self._on_theme_toggled)
+        self.search_input.textChanged.connect(self._apply_filters)
+        self.type_filter.currentIndexChanged.connect(self._apply_filters)
+        self.size_filter.currentIndexChanged.connect(self._apply_filters)
+        self.table.itemSelectionChanged.connect(self._update_bucket_actions_state)
+        self.copy_share_btn.clicked.connect(self.copy_selected_share_url)
+        self.open_share_btn.clicked.connect(self.open_selected_share_url)
+
+        self._setup_context_menus()
+        self._setup_more_menu()
 
     def _set_human_friendly_defaults(self) -> None:
         self.auth_btn.setObjectName("primaryBtn")
         self.upload_btn.setObjectName("primaryBtn")
+        self.download_btn.setObjectName("secondaryBtn")
+        self.more_btn.setObjectName("secondaryBtn")
+        self.pause_btn.setObjectName("secondaryBtn")
+        self.resume_btn.setObjectName("secondaryBtn")
+        self.stop_btn.setObjectName("dangerBtn")
         self.refresh_btn.setObjectName("secondaryBtn")
+        self.sync_btn.setObjectName("secondaryBtn")
         self.copy_public_btn.setObjectName("secondaryBtn")
         self.open_public_btn.setObjectName("secondaryBtn")
         self.copy_private_btn.setObjectName("secondaryBtn")
@@ -532,6 +694,12 @@ class MainWindow(QMainWindow):
         self.download_folder_btn.setObjectName("secondaryBtn")
         self.remove_selected_btn.setObjectName("dangerBtn")
         self._configure_hints()
+        self._polish_tables()
+        self.resume_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.download_btn.setEnabled(False)
+        self._update_bucket_actions_state()
 
         self._apply_theme("dark")
 
@@ -567,33 +735,33 @@ class MainWindow(QMainWindow):
                   background: #ffffff;
                 }
                 QLineEdit:focus { border: 1px solid #60a5fa; }
-                QPushButton {
+                QPushButton, QToolButton {
                   padding: 7px 12px;
                   border-radius: 8px;
                   border: 1px solid #cbd5e1;
                   background: #ffffff;
                 }
-                QPushButton:hover { background: #f8fafc; }
-                QPushButton#primaryBtn {
+                QPushButton:hover, QToolButton:hover { background: #f8fafc; }
+                QPushButton#primaryBtn, QToolButton#primaryBtn {
                   background: #2563eb;
                   border: 1px solid #2563eb;
                   color: white;
                   font-weight: 600;
                 }
-                QPushButton#primaryBtn:hover { background: #1e4fd8; }
-                QPushButton#secondaryBtn {
+                QPushButton#primaryBtn:hover, QToolButton#primaryBtn:hover { background: #1e4fd8; }
+                QPushButton#secondaryBtn, QToolButton#secondaryBtn {
                   background: #0f766e;
                   border: 1px solid #0f766e;
                   color: white;
                   font-weight: 600;
                 }
-                QPushButton#secondaryBtn:hover { background: #0d635c; }
-                QPushButton#dangerBtn {
+                QPushButton#secondaryBtn:hover, QToolButton#secondaryBtn:hover { background: #0d635c; }
+                QPushButton#dangerBtn, QToolButton#dangerBtn {
                   background: #fef2f2;
                   color: #b91c1c;
                   border: 1px solid #fecaca;
                 }
-                QPushButton:disabled {
+                QPushButton:disabled, QToolButton:disabled {
                   color: #9ca3af;
                   background: #f1f5f9;
                   border: 1px solid #e2e8f0;
@@ -613,6 +781,26 @@ class MainWindow(QMainWindow):
                   padding: 6px;
                   font-weight: 600;
                   color: #334155;
+                }
+                QTabWidget::pane {
+                  border: 1px solid #dbe3f0;
+                  border-radius: 10px;
+                  top: -1px;
+                  background: #ffffff;
+                }
+                QTabBar::tab {
+                  background: #eef2ff;
+                  color: #334155;
+                  border: 1px solid #dbe3f0;
+                  border-bottom: none;
+                  border-top-left-radius: 8px;
+                  border-top-right-radius: 8px;
+                  padding: 6px 12px;
+                  margin-right: 4px;
+                }
+                QTabBar::tab:selected {
+                  background: #ffffff;
+                  color: #0f172a;
                 }
                 QProgressBar {
                   min-height: 18px;
@@ -660,34 +848,34 @@ class MainWindow(QMainWindow):
               color: #f3f4f6;
             }
             QLineEdit:focus { border: 1px solid #60a5fa; }
-            QPushButton {
+            QPushButton, QToolButton {
               padding: 7px 12px;
               border-radius: 8px;
               border: 1px solid #3f3f46;
               background: #1b1b21;
               color: #e5e7eb;
             }
-            QPushButton:hover { background: #23232b; }
-            QPushButton#primaryBtn {
+            QPushButton:hover, QToolButton:hover { background: #23232b; }
+            QPushButton#primaryBtn, QToolButton#primaryBtn {
               background: #2563eb;
               border: 1px solid #2563eb;
               color: white;
               font-weight: 600;
             }
-            QPushButton#primaryBtn:hover { background: #1e4fd8; }
-            QPushButton#secondaryBtn {
+            QPushButton#primaryBtn:hover, QToolButton#primaryBtn:hover { background: #1e4fd8; }
+            QPushButton#secondaryBtn, QToolButton#secondaryBtn {
               background: #0f766e;
               border: 1px solid #0f766e;
               color: white;
               font-weight: 600;
             }
-            QPushButton#secondaryBtn:hover { background: #0d635c; }
-            QPushButton#dangerBtn {
+            QPushButton#secondaryBtn:hover, QToolButton#secondaryBtn:hover { background: #0d635c; }
+            QPushButton#dangerBtn, QToolButton#dangerBtn {
               background: #3a1113;
               color: #fecaca;
               border: 1px solid #7f1d1d;
             }
-            QPushButton:disabled {
+            QPushButton:disabled, QToolButton:disabled {
               color: #6b7280;
               background: #16161b;
               border: 1px solid #2a2a2f;
@@ -708,6 +896,26 @@ class MainWindow(QMainWindow):
               font-weight: 600;
               color: #f3f4f6;
             }
+            QTabWidget::pane {
+              border: 1px solid #2a2a2f;
+              border-radius: 10px;
+              top: -1px;
+              background: #141418;
+            }
+            QTabBar::tab {
+              background: #1c2230;
+              color: #cbd5e1;
+              border: 1px solid #2f3544;
+              border-bottom: none;
+              border-top-left-radius: 8px;
+              border-top-right-radius: 8px;
+              padding: 6px 12px;
+              margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+              background: #141418;
+              color: #f8fafc;
+            }
             QProgressBar {
               min-height: 18px;
               border: 1px solid #2f2f37;
@@ -726,6 +934,198 @@ class MainWindow(QMainWindow):
     def _on_theme_toggled(self, checked: bool) -> None:
         self._apply_theme("dark" if checked else "light")
 
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Find):
+            self.search_input.setFocus()
+            self.search_input.selectAll()
+            event.accept()
+            return
+
+        if event.matches(QKeySequence.Refresh):
+            self.refresh_files()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_Delete:
+            if self.queue_table.hasFocus():
+                self.remove_selected_upload_items()
+                event.accept()
+                return
+
+        if event.key() == Qt.Key_Space:
+            focused = QApplication.focusWidget()
+            if isinstance(focused, QLineEdit):
+                super().keyPressEvent(event)
+                return
+            if self.transfer_active:
+                if self.transfer_pause.is_set():
+                    self.resume_transfer()
+                else:
+                    self.pause_transfer()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    def dropEvent(self, event) -> None:
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        items: List[Tuple[str, str, int]] = []
+        for url in urls:
+            path = url.toLocalFile()
+            if not path:
+                continue
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+                items.append((path, os.path.basename(path), size))
+            elif os.path.isdir(path):
+                base_name = os.path.basename(path.rstrip(os.sep))
+                for root, _, files in os.walk(path):
+                    for file_name in files:
+                        local_path = os.path.join(root, file_name)
+                        rel_path = os.path.relpath(local_path, path).replace("\\", "/")
+                        target_rel = f"{base_name}/{rel_path}"
+                        size = os.path.getsize(local_path)
+                        items.append((local_path, target_rel, size))
+        if items:
+            items.sort(key=lambda x: x[1])
+            self._merge_upload_items(items)
+            self.set_status(f"Added {len(items)} item(s) via drag & drop")
+            event.acceptProposedAction()
+
+    def _set_transfer_state(self, active: bool) -> None:
+        self.transfer_active = active
+        if not active:
+            self.transfer_pause.clear()
+            self.transfer_stop.clear()
+        self.pause_btn.setEnabled(active and not self.transfer_pause.is_set())
+        self.resume_btn.setEnabled(active and self.transfer_pause.is_set())
+        self.stop_btn.setEnabled(active)
+
+    def pause_transfer(self) -> None:
+        if not self.transfer_active:
+            return
+        self.transfer_pause.set()
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(True)
+        self.progress_label.setText("Paused")
+
+    def resume_transfer(self) -> None:
+        if not self.transfer_active:
+            return
+        self.transfer_pause.clear()
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+
+    def stop_transfer(self) -> None:
+        if not self.transfer_active:
+            return
+        self.transfer_stop.set()
+        self.transfer_pause.clear()
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.progress_label.setText("Stopping...")
+
+    def _wait_if_paused(self) -> None:
+        while self.transfer_pause.is_set() and not self.transfer_stop.is_set():
+            time.sleep(0.1)
+
+    def _should_stop_transfer(self) -> bool:
+        return self.transfer_stop.is_set()
+
+    def _append_history(self, action: str, status: str, details: str, bytes_count: int = 0) -> None:
+        self.history_store.append(action, status, details, bytes_count)
+        self._refresh_history_table()
+
+    def _refresh_history_table(self) -> None:
+        rows = self.history_store.tail(120)
+        rows.reverse()
+        self.history_table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            ts_raw = str(row.get("ts", ""))
+            ts = ts_raw.replace("T", " ").replace("+00:00", "")
+            action = str(row.get("action", ""))
+            status = str(row.get("status", ""))
+            details = str(row.get("details", ""))
+            bytes_count = int(row.get("bytes", 0) or 0)
+            self.history_table.setItem(i, 0, QTableWidgetItem(ts))
+            self.history_table.setItem(i, 1, QTableWidgetItem(action))
+            self.history_table.setItem(i, 2, QTableWidgetItem(status))
+            self.history_table.setItem(i, 3, QTableWidgetItem(format_bytes(bytes_count)))
+            self.history_table.setItem(i, 4, QTableWidgetItem(details))
+
+    def _append_share(self, file_name: str, link_type: str, url: str, ttl_seconds: Optional[int]) -> None:
+        created = dt.datetime.now(dt.timezone.utc)
+        expires = ""
+        if ttl_seconds:
+            expires = (created + dt.timedelta(seconds=ttl_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        row = {
+            "file": file_name,
+            "type": link_type,
+            "created": created.strftime("%Y-%m-%d %H:%M:%S"),
+            "expires": expires,
+            "url": url,
+        }
+        self.share_rows.insert(0, row)
+        self.share_rows = self.share_rows[:300]
+        self._refresh_share_table()
+
+    def _refresh_share_table(self) -> None:
+        self.share_table.setRowCount(len(self.share_rows))
+        for i, row in enumerate(self.share_rows):
+            self.share_table.setItem(i, 0, QTableWidgetItem(row["file"]))
+            self.share_table.setItem(i, 1, QTableWidgetItem(row["type"]))
+            self.share_table.setItem(i, 2, QTableWidgetItem(row["created"]))
+            self.share_table.setItem(i, 3, QTableWidgetItem(row["expires"]))
+            url_item = QTableWidgetItem(row["url"])
+            url_item.setToolTip(row["url"])
+            self.share_table.setItem(i, 4, url_item)
+
+    def _selected_share_url(self) -> Optional[str]:
+        row = self.share_table.currentRow()
+        if row < 0 or row >= len(self.share_rows):
+            return None
+        return self.share_rows[row]["url"]
+
+    def copy_selected_share_url(self) -> None:
+        url = self._selected_share_url()
+        if not url:
+            QMessageBox.information(self, "Share Manager", "Select a row in Share Manager.")
+            return
+        self._copy_text(url)
+        self.set_status("Share URL copied")
+
+    def open_selected_share_url(self) -> None:
+        url = self._selected_share_url()
+        if not url:
+            QMessageBox.information(self, "Share Manager", "Select a row in Share Manager.")
+            return
+        QDesktopServices.openUrl(QUrl(url))
+        self.set_status("Share URL opened")
+
+    def _notify_transfer_done(self, title: str, message: str) -> None:
+        if self.background_check.isChecked():
+            QApplication.alert(self, 3000)
+            return
+        QMessageBox.information(self, title, message)
+
+    def _update_bucket_actions_state(self) -> None:
+        has_selection = bool(self._selected_file_names())
+        self.download_btn.setEnabled(has_selection)
+        target_role = "primaryBtn" if has_selection else "secondaryBtn"
+        if self.download_btn.objectName() != target_role:
+            self.download_btn.setObjectName(target_role)
+            self.download_btn.style().unpolish(self.download_btn)
+            self.download_btn.style().polish(self.download_btn)
+            self.download_btn.update()
+
     def _configure_hints(self) -> None:
         self.key_id_input.setPlaceholderText("e.g. 004a7f3f...")
         self.app_key_input.setPlaceholderText("Application Key")
@@ -737,21 +1137,185 @@ class MainWindow(QMainWindow):
         self.select_files_btn.setToolTip("Pick one or more individual files.")
         self.select_folder_btn.setToolTip("Pick a folder. All files inside will be uploaded recursively.")
         self.upload_btn.setToolTip("Start uploading all queued items.")
+        self.download_btn.setToolTip("Download selected files from bucket table.")
+        self.more_btn.setToolTip("More actions and advanced controls.")
         self.clear_selection_btn.setToolTip("Clear the whole upload queue.")
         self.remove_selected_btn.setToolTip("Remove selected rows from upload queue preview.")
         self.download_selected_btn.setToolTip("Download selected files from bucket to a local folder.")
         self.download_folder_btn.setToolTip("Download all files by prefix from bucket.")
+        self.pause_btn.setToolTip("Pause current transfer (upload/download).")
+        self.resume_btn.setToolTip("Resume paused transfer.")
+        self.stop_btn.setToolTip("Stop current transfer.")
+        self.sync_btn.setToolTip("Choose local folder and upload missing/changed files into selected prefix.")
+
+    def _polish_tables(self) -> None:
+        sortable = [self.table, self.history_table]
+        for t in [self.queue_table] + sortable:
+            t.verticalHeader().setVisible(False)
+            t.setShowGrid(False)
+            t.setWordWrap(False)
+        for t in sortable:
+            t.setSortingEnabled(True)
+
+    def _setup_context_menus(self) -> None:
+        self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.share_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_table.setContextMenuPolicy(Qt.CustomContextMenu)
+
+        self.queue_table.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self.table.customContextMenuRequested.connect(self._show_files_context_menu)
+        self.share_table.customContextMenuRequested.connect(self._show_share_context_menu)
+        self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
+
+    def _setup_more_menu(self) -> None:
+        menu = QMenu(self)
+        self.more_btn.setMenu(menu)
+
+        self.more_save_action = QAction("Save Settings", self)
+        self.more_select_files_action = QAction("Select Files", self)
+        self.more_select_folder_action = QAction("Select Folder", self)
+        self.more_clear_queue_action = QAction("Clear Queue", self)
+        self.more_download_folder_action = QAction("Download Folder by Prefix", self)
+        self.more_sync_action = QAction("Sync Folder -> Prefix", self)
+        self.more_pause_action = QAction("Pause Transfer", self)
+        self.more_resume_action = QAction("Resume Transfer", self)
+        self.more_stop_action = QAction("Stop Transfer", self)
+        self.more_background_action = QAction("Background Transfers", self)
+        self.more_background_action.setCheckable(True)
+
+        menu.addAction(self.more_save_action)
+        menu.addSeparator()
+        menu.addAction(self.more_select_files_action)
+        menu.addAction(self.more_select_folder_action)
+        menu.addAction(self.more_clear_queue_action)
+        menu.addSeparator()
+        menu.addAction(self.more_download_folder_action)
+        menu.addAction(self.more_sync_action)
+        menu.addSeparator()
+        menu.addAction(self.more_pause_action)
+        menu.addAction(self.more_resume_action)
+        menu.addAction(self.more_stop_action)
+        menu.addSeparator()
+        menu.addAction(self.more_background_action)
+
+        self.more_save_action.triggered.connect(self.save_settings)
+        self.more_select_files_action.triggered.connect(self.select_files)
+        self.more_select_folder_action.triggered.connect(self.select_folder)
+        self.more_clear_queue_action.triggered.connect(self.clear_upload_selection)
+        self.more_download_folder_action.triggered.connect(self.download_folder_by_prefix)
+        self.more_sync_action.triggered.connect(self.sync_folder_to_prefix)
+        self.more_pause_action.triggered.connect(self.pause_transfer)
+        self.more_resume_action.triggered.connect(self.resume_transfer)
+        self.more_stop_action.triggered.connect(self.stop_transfer)
+        self.more_background_action.toggled.connect(self.background_check.setChecked)
+        self.background_check.toggled.connect(self.more_background_action.setChecked)
+
+        menu.aboutToShow.connect(self._sync_more_menu_state)
+
+    def _sync_more_menu_state(self) -> None:
+        self.more_clear_queue_action.setEnabled(bool(self.selected_upload_items))
+        self.more_pause_action.setEnabled(self.transfer_active and not self.transfer_pause.is_set())
+        self.more_resume_action.setEnabled(self.transfer_active and self.transfer_pause.is_set())
+        self.more_stop_action.setEnabled(self.transfer_active)
+        self.more_background_action.setChecked(self.background_check.isChecked())
+
+    def _select_row_at_context(self, table: QTableWidget, pos) -> None:
+        item = table.itemAt(pos)
+        if item:
+            table.selectRow(item.row())
+
+    def _show_queue_context_menu(self, pos) -> None:
+        self._select_row_at_context(self.queue_table, pos)
+        menu = QMenu(self)
+        act_remove = menu.addAction("Remove Selected")
+        act_clear = menu.addAction("Clear Queue")
+        act_remove.setEnabled(bool(self.queue_table.selectionModel().selectedRows()))
+        act_clear.setEnabled(bool(self.selected_upload_items))
+        chosen = menu.exec(self.queue_table.viewport().mapToGlobal(pos))
+        if chosen == act_remove:
+            self.remove_selected_upload_items()
+        elif chosen == act_clear:
+            self.clear_upload_selection()
+
+    def _show_files_context_menu(self, pos) -> None:
+        self._select_row_at_context(self.table, pos)
+        selected = self._selected_file_names()
+        has_selection = bool(selected)
+
+        menu = QMenu(self)
+        act_copy_public = menu.addAction("Copy Public Link")
+        act_open_public = menu.addAction("Open Public Link")
+        act_copy_private = menu.addAction("Copy Private Link")
+        act_open_private = menu.addAction("Open Private Link")
+        menu.addSeparator()
+        act_download = menu.addAction("Download Selected")
+        act_refresh = menu.addAction("Refresh List")
+
+        for action in [act_copy_public, act_open_public, act_copy_private, act_open_private, act_download]:
+            action.setEnabled(has_selection)
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == act_copy_public:
+            self.copy_public_link()
+        elif chosen == act_open_public:
+            self.open_public_link()
+        elif chosen == act_copy_private:
+            self.copy_private_link()
+        elif chosen == act_open_private:
+            self.open_private_link()
+        elif chosen == act_download:
+            self.download_selected_files()
+        elif chosen == act_refresh:
+            self.refresh_files()
+
+    def _show_share_context_menu(self, pos) -> None:
+        self._select_row_at_context(self.share_table, pos)
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy Share URL")
+        act_open = menu.addAction("Open Share URL")
+        has_selection = self._selected_share_url() is not None
+        act_copy.setEnabled(has_selection)
+        act_open.setEnabled(has_selection)
+        chosen = menu.exec(self.share_table.viewport().mapToGlobal(pos))
+        if chosen == act_copy:
+            self.copy_selected_share_url()
+        elif chosen == act_open:
+            self.open_selected_share_url()
+
+    def _show_history_context_menu(self, pos) -> None:
+        self._select_row_at_context(self.history_table, pos)
+        row = self.history_table.currentRow()
+        menu = QMenu(self)
+        act_copy_row = menu.addAction("Copy Row")
+        act_copy_row.setEnabled(row >= 0)
+        chosen = menu.exec(self.history_table.viewport().mapToGlobal(pos))
+        if chosen != act_copy_row or row < 0:
+            return
+        values = []
+        for col in range(self.history_table.columnCount()):
+            item = self.history_table.item(row, col)
+            values.append(item.text() if item else "")
+        self._copy_text(" | ".join(values))
+        self.set_status("History row copied")
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
     def _set_busy(self, busy: bool) -> None:
+        if self.transfer_background and self.transfer_active:
+            self.pause_btn.setEnabled(self.transfer_active and not self.transfer_pause.is_set())
+            self.resume_btn.setEnabled(self.transfer_active and self.transfer_pause.is_set())
+            self.stop_btn.setEnabled(self.transfer_active)
+            return
         controls = [
             self.save_btn,
             self.auth_btn,
             self.select_files_btn,
             self.select_folder_btn,
             self.clear_selection_btn,
+            self.download_btn,
+            self.more_btn,
             self.remove_selected_btn,
             self.dark_theme_check,
             self.upload_btn,
@@ -762,6 +1326,10 @@ class MainWindow(QMainWindow):
             self.open_private_btn,
             self.download_selected_btn,
             self.download_folder_btn,
+            self.sync_btn,
+            self.search_input,
+            self.type_filter,
+            self.size_filter,
         ]
         for w in controls:
             w.setEnabled(not busy)
@@ -775,6 +1343,7 @@ class MainWindow(QMainWindow):
             "prefix": self.prefix_input.text().strip(),
             "remember": self.remember_check.isChecked(),
             "private_ttl": self.ttl_input.text().strip() or "3600",
+            "background": self.background_check.isChecked(),
         }
 
     def _private_ttl(self) -> int:
@@ -799,8 +1368,11 @@ class MainWindow(QMainWindow):
             self.client.authorize(cfg["key_id"], cfg["app_key"])
             self.last_auth_key = key
 
-    def _run_bg(self, fn, on_success=None, on_progress=None) -> None:
+    def _run_bg(self, fn, on_success=None, on_progress=None, transfer_job: bool = False, action_name: str = "") -> None:
         signals = WorkerSignals()
+        if transfer_job:
+            self.transfer_background = self.background_check.isChecked()
+            self._set_transfer_state(True)
         self._set_busy(True)
 
         def handle_success(result: object) -> None:
@@ -809,14 +1381,24 @@ class MainWindow(QMainWindow):
                     on_success(result)
             finally:
                 self._set_busy(False)
+                if transfer_job:
+                    self._set_transfer_state(False)
                 self._workers.remove(signals)
 
         def handle_error(msg: str) -> None:
             try:
-                QMessageBox.critical(self, "Error", msg)
-                self.set_status("Error")
+                if "stopped by user" in msg.lower():
+                    self.set_status("Stopped")
+                    self.progress_label.setText("Stopped")
+                else:
+                    QMessageBox.critical(self, "Error", msg)
+                    self.set_status("Error")
+                if transfer_job and action_name:
+                    self._append_history(action_name, "error", msg)
             finally:
                 self._set_busy(False)
+                if transfer_job:
+                    self._set_transfer_state(False)
                 self._workers.remove(signals)
 
         signals.success.connect(handle_success)
@@ -846,6 +1428,7 @@ class MainWindow(QMainWindow):
         self.prefix_input.setText(data.get("prefix", ""))
         self.ttl_input.setText(str(data.get("private_ttl", 3600)))
         self.remember_check.setChecked(bool(data.get("remember", True)))
+        self.background_check.setChecked(bool(data.get("background", False)))
         theme = str(data.get("theme", "dark")).lower()
         if theme not in ("dark", "light"):
             theme = "dark"
@@ -865,6 +1448,7 @@ class MainWindow(QMainWindow):
             "private_ttl": self._private_ttl(),
             "remember": cfg["remember"],
             "theme": "dark" if self.dark_theme_check.isChecked() else "light",
+            "background": cfg["background"],
         }
         self.settings_store.save(payload)
         self.set_status(f"Settings saved: {self.settings_store.path}")
@@ -974,12 +1558,17 @@ class MainWindow(QMainWindow):
         self.set_status(f"Uploading {total_files} file(s)...")
         self.progress_label.setText("Preparing upload...")
         self.progress_bar.setValue(0)
+        self.transfer_stop.clear()
+        self.transfer_pause.clear()
 
         def task(progress):
             self._ensure_authorized(cfg)
             uploaded_done = 0
+            retries = 3
 
             for idx, (local_path, target_rel, file_size) in enumerate(items, start=1):
+                if self._should_stop_transfer():
+                    raise RuntimeError("Transfer stopped by user.")
                 file_name_in_bucket = f"{prefix}/{target_rel}" if prefix else target_rel
                 file_label = os.path.basename(local_path)
 
@@ -1008,12 +1597,27 @@ class MainWindow(QMainWindow):
                             f"[{idx}/{total_files}] Calculating checksum for {file_label}...",
                         )
 
-                self.client.upload_file(
-                    cfg["bucket_id"],
-                    local_path,
-                    file_name_in_bucket,
-                    progress_cb=upload_progress,
-                )
+                attempt = 0
+                while True:
+                    try:
+                        self.client.upload_file(
+                            cfg["bucket_id"],
+                            local_path,
+                            file_name_in_bucket,
+                            progress_cb=upload_progress,
+                            should_stop=self._should_stop_transfer,
+                            wait_if_paused=self._wait_if_paused,
+                        )
+                        break
+                    except Exception:
+                        attempt += 1
+                        if attempt >= retries:
+                            raise
+                        progress(
+                            int((uploaded_done * 100) / max(1, total_bytes)),
+                            f"[{idx}/{total_files}] Retry {attempt}/{retries - 1} for {file_label}...",
+                        )
+                        time.sleep(min(2 * attempt, 5))
                 uploaded_done += file_size
 
             progress(
@@ -1027,14 +1631,15 @@ class MainWindow(QMainWindow):
             self.set_status("Upload completed")
             self.progress_label.setText("Upload completed")
             self.progress_bar.setValue(100)
-            QMessageBox.information(self, "Uploaded", f"Uploaded {total_files} file(s).")
+            self._append_history("upload", "success", f"{total_files} files", total_bytes)
+            self._notify_transfer_done("Uploaded", f"Uploaded {total_files} file(s).")
             self.clear_upload_selection()
 
         def on_progress(pct: int, text: str) -> None:
             self.progress_bar.setValue(max(0, min(100, pct)))
             self.progress_label.setText(text)
 
-        self._run_bg(task, done, on_progress)
+        self._run_bg(task, done, on_progress, transfer_job=True, action_name="upload")
 
     def refresh_files(self) -> None:
         cfg = self._current_config()
@@ -1055,9 +1660,55 @@ class MainWindow(QMainWindow):
         self._run_bg(task, done)
 
     def _fill_table(self, files: object) -> None:
-        rows = list(files)
-        self.file_rows = rows
+        self.file_rows = list(files)
+        self._apply_filters()
 
+    def _file_type_matches(self, file_name: str, choice: str) -> bool:
+        ext = Path(file_name).suffix.lower().lstrip(".")
+        if choice == "All types":
+            return True
+        groups = {
+            "Images": {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"},
+            "Video": {"mp4", "mov", "avi", "mkv", "webm", "m4v"},
+            "Audio": {"mp3", "wav", "flac", "aac", "ogg", "m4a"},
+            "Documents": {"pdf", "doc", "docx", "txt", "rtf", "xls", "xlsx", "ppt", "pptx"},
+            "Archives": {"zip", "rar", "7z", "tar", "gz", "bz2"},
+        }
+        return ext in groups.get(choice, set())
+
+    def _size_filter_matches(self, size: int, choice: str) -> bool:
+        mb = 1024 * 1024
+        gb = 1024 * mb
+        if choice == "Any size":
+            return True
+        if choice == "< 10 MB":
+            return size < 10 * mb
+        if choice == "10-100 MB":
+            return 10 * mb <= size <= 100 * mb
+        if choice == "100 MB - 1 GB":
+            return 100 * mb < size <= gb
+        if choice == "> 1 GB":
+            return size > gb
+        return True
+
+    def _apply_filters(self) -> None:
+        query = self.search_input.text().strip().lower() if hasattr(self, "search_input") else ""
+        type_choice = self.type_filter.currentText() if hasattr(self, "type_filter") else "All types"
+        size_choice = self.size_filter.currentText() if hasattr(self, "size_filter") else "Any size"
+
+        self.filtered_rows = []
+        for row in self.file_rows:
+            file_name = row.get("fileName", "")
+            size = self._extract_file_size(row)
+            if query and query not in file_name.lower():
+                continue
+            if not self._file_type_matches(file_name, type_choice):
+                continue
+            if not self._size_filter_matches(size, size_choice):
+                continue
+            self.filtered_rows.append(row)
+
+        rows = self.filtered_rows
         self.table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             file_name = row.get("fileName", "")
@@ -1075,6 +1726,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 0, name_item)
             self.table.setItem(i, 1, size_item)
             self.table.setItem(i, 2, uploaded_item)
+        self.set_status(f"Loaded {len(self.filtered_rows)} file(s) (filtered)")
 
     def _extract_file_size(self, row: Dict) -> int:
         # B2 may return size as `size` (list_file_names) or `contentLength` (versions/other APIs).
@@ -1130,7 +1782,10 @@ class MainWindow(QMainWindow):
             return self._public_link_task(cfg, file_name)
 
         def done(link: object) -> None:
-            self._copy_text(str(link))
+            url = str(link)
+            self._copy_text(url)
+            self._append_share(file_name, "public", url, None)
+            self._append_history("share-public", "success", file_name)
             self.set_status("Public link copied")
 
         self._run_bg(task, done)
@@ -1151,7 +1806,10 @@ class MainWindow(QMainWindow):
             return self._public_link_task(cfg, file_name)
 
         def done(link: object) -> None:
-            QDesktopServices.openUrl(QUrl(str(link)))
+            url = str(link)
+            QDesktopServices.openUrl(QUrl(url))
+            self._append_share(file_name, "public", url, None)
+            self._append_history("share-public", "success", file_name)
             self.set_status("Public link opened")
 
         self._run_bg(task, done)
@@ -1172,7 +1830,10 @@ class MainWindow(QMainWindow):
             return self._private_link_task(cfg, file_name)
 
         def done(link: object) -> None:
-            self._copy_text(str(link))
+            url = str(link)
+            self._copy_text(url)
+            self._append_share(file_name, "private", url, self._private_ttl())
+            self._append_history("share-private", "success", file_name)
             self.set_status("Private link copied")
 
         self._run_bg(task, done)
@@ -1193,7 +1854,10 @@ class MainWindow(QMainWindow):
             return self._private_link_task(cfg, file_name)
 
         def done(link: object) -> None:
-            QDesktopServices.openUrl(QUrl(str(link)))
+            url = str(link)
+            QDesktopServices.openUrl(QUrl(url))
+            self._append_share(file_name, "private", url, self._private_ttl())
+            self._append_history("share-private", "success", file_name)
             self.set_status("Private link opened")
 
         self._run_bg(task, done)
@@ -1209,12 +1873,17 @@ class MainWindow(QMainWindow):
         self.set_status(f"Downloading {total_files} file(s)...")
         self.progress_bar.setValue(0)
         self.progress_label.setText("Preparing download...")
+        self.transfer_stop.clear()
+        self.transfer_pause.clear()
 
         def task(progress):
             self._ensure_authorized(cfg)
             downloaded_done = 0
+            retries = 3
 
             for idx, file_name in enumerate(file_names, start=1):
+                if self._should_stop_transfer():
+                    raise RuntimeError("Transfer stopped by user.")
                 target_path = os.path.join(destination_root, file_name.replace("/", os.sep))
                 file_label = os.path.basename(file_name) or file_name
 
@@ -1236,12 +1905,27 @@ class MainWindow(QMainWindow):
                     else:
                         progress(0, f"[{idx}/{total_files}] Downloading {file_label}...")
 
-                self.client.download_file(
-                    cfg["bucket_name"],
-                    file_name,
-                    target_path,
-                    progress_cb=on_file_progress,
-                )
+                attempt = 0
+                while True:
+                    try:
+                        self.client.download_file(
+                            cfg["bucket_name"],
+                            file_name,
+                            target_path,
+                            progress_cb=on_file_progress,
+                            should_stop=self._should_stop_transfer,
+                            wait_if_paused=self._wait_if_paused,
+                        )
+                        break
+                    except Exception:
+                        attempt += 1
+                        if attempt >= retries:
+                            raise
+                        progress(
+                            int((downloaded_done * 100) / max(1, total_expected)) if total_expected else 0,
+                            f"[{idx}/{total_files}] Retry {attempt}/{retries - 1} for {file_label}...",
+                        )
+                        time.sleep(min(2 * attempt, 5))
 
                 file_size = 0
                 try:
@@ -1257,13 +1941,14 @@ class MainWindow(QMainWindow):
             self.set_status("Download completed")
             self.progress_label.setText("Download completed")
             self.progress_bar.setValue(100)
-            QMessageBox.information(self, "Downloaded", f"Downloaded {total_files} file(s).")
+            self._append_history("download", "success", f"{total_files} files", total_expected)
+            self._notify_transfer_done("Downloaded", f"Downloaded {total_files} file(s).")
 
         def on_progress(pct: int, text: str) -> None:
             self.progress_bar.setValue(max(0, min(100, pct)))
             self.progress_label.setText(text)
 
-        self._run_bg(task, done, on_progress)
+        self._run_bg(task, done, on_progress, transfer_job=True, action_name="download")
 
     def download_selected_files(self) -> None:
         cfg = self._current_config()
@@ -1318,6 +2003,102 @@ class MainWindow(QMainWindow):
             self.progress_label.setText(text)
 
         self._run_bg(task, done, on_progress)
+
+    def sync_folder_to_prefix(self) -> None:
+        cfg = self._current_config()
+        if not cfg["bucket_id"]:
+            QMessageBox.warning(self, "Missing data", "Bucket ID is required.")
+            return
+        prefix = cfg["prefix"].strip("/")
+        folder = QFileDialog.getExistingDirectory(self, "Select local folder to sync")
+        if not folder:
+            return
+
+        self.set_status("Sync: loading remote index...")
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Sync: loading remote index...")
+
+        def task(progress):
+            self._ensure_authorized(cfg)
+            remote_files = self.client.list_files_all(cfg["bucket_id"], prefix=prefix)
+            remote_index: Dict[str, int] = {}
+            for row in remote_files:
+                name = row.get("fileName", "")
+                if not name:
+                    continue
+                rel = name
+                if prefix and rel.startswith(prefix + "/"):
+                    rel = rel[len(prefix) + 1 :]
+                remote_index[rel] = self._extract_file_size(row)
+
+            local_items: List[Tuple[str, str, int]] = []
+            for root, _, files in os.walk(folder):
+                for file_name in files:
+                    local_path = os.path.join(root, file_name)
+                    rel_path = os.path.relpath(local_path, folder).replace("\\", "/")
+                    size = os.path.getsize(local_path)
+                    remote_size = remote_index.get(rel_path)
+                    if remote_size != size:
+                        target_rel = rel_path
+                        local_items.append((local_path, target_rel, size))
+
+            if not local_items:
+                progress(100, "Sync: everything is up to date.")
+                return {"items": [], "bytes": 0}
+
+            total = len(local_items)
+            total_bytes = sum(item[2] for item in local_items)
+            uploaded = 0
+
+            for idx, (local_path, target_rel, size) in enumerate(local_items, start=1):
+                if self._should_stop_transfer():
+                    raise RuntimeError("Sync stopped by user.")
+                self._wait_if_paused()
+                file_name_in_bucket = f"{prefix}/{target_rel}" if prefix else target_rel
+                label = os.path.basename(local_path)
+
+                def sync_progress(phase: str, current: int, _total: int) -> None:
+                    if phase != "upload":
+                        return
+                    global_current = uploaded + current
+                    pct = int((global_current * 100) / max(1, total_bytes))
+                    progress(
+                        pct,
+                        f"[{idx}/{total}] Syncing {label} | "
+                        f"{format_bytes(global_current)} / {format_bytes(total_bytes)} uploaded",
+                    )
+
+                self.client.upload_file(
+                    cfg["bucket_id"],
+                    local_path,
+                    file_name_in_bucket,
+                    progress_cb=sync_progress,
+                    should_stop=self._should_stop_transfer,
+                    wait_if_paused=self._wait_if_paused,
+                )
+                uploaded += size
+
+            progress(100, f"Sync completed: {len(local_items)} file(s)")
+            return {"items": local_items, "bytes": total_bytes}
+
+        def done(result: object) -> None:
+            data = dict(result)
+            items = list(data.get("items", []))
+            total_bytes = int(data.get("bytes", 0))
+            self._append_history("sync", "success", f"{len(items)} files", total_bytes)
+            if not items:
+                self._notify_transfer_done("Sync", "Everything is already up to date.")
+                self.set_status("Sync completed (no changes)")
+                return
+            self.set_status(f"Sync completed: {len(items)} file(s)")
+            self._notify_transfer_done("Sync", f"Synced {len(items)} file(s).")
+            self.refresh_files()
+
+        def on_progress(pct: int, text: str) -> None:
+            self.progress_bar.setValue(max(0, min(100, pct)))
+            self.progress_label.setText(text)
+
+        self._run_bg(task, done, on_progress, transfer_job=True, action_name="sync")
 
 
 def run() -> None:
