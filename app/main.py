@@ -523,6 +523,9 @@ class MainWindow(QMainWindow):
 
         self.file_rows = []
         self.filtered_rows = []
+        self.browser_rows: List[Dict] = []
+        self.base_bucket_prefix = ""
+        self.current_folder_prefix = ""
         self.share_rows: List[Dict] = []
         self.selected_upload_items: List[Tuple[str, str, int]] = []
         self._workers = []
@@ -706,25 +709,37 @@ class MainWindow(QMainWindow):
         files_layout.setSpacing(8)
 
         filters_row = QHBoxLayout()
+        self.folder_back_btn = QPushButton("Back")
+        self.folder_back_btn.setEnabled(False)
+        self.breadcrumb_container = QWidget()
+        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_container)
+        self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
+        self.breadcrumb_layout.setSpacing(4)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search file name...")
         self.type_filter = QComboBox()
         self.type_filter.addItems(["All types", "Images", "Video", "Audio", "Documents", "Archives"])
         self.size_filter = QComboBox()
         self.size_filter.addItems(["Any size", "< 10 MB", "10-100 MB", "100 MB - 1 GB", "> 1 GB"])
+        self.download_folder_current_btn = QPushButton("Download Folder")
+        filters_row.addWidget(self.folder_back_btn)
+        filters_row.addWidget(self.breadcrumb_container, 2)
         filters_row.addWidget(self.search_input, 2)
         filters_row.addWidget(self.type_filter, 1)
         filters_row.addWidget(self.size_filter, 1)
+        filters_row.addWidget(self.download_folder_current_btn)
         filters_row.addStretch(1)
         filters_row.addWidget(self.refresh_btn)
         files_layout.addLayout(filters_row)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["File Name", "Size", "Uploaded (UTC)", "Preview"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Name", "Type", "Size", "Uploaded (UTC)", "Preview", "Download"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -810,6 +825,9 @@ class MainWindow(QMainWindow):
         self.type_filter.currentIndexChanged.connect(self._apply_filters)
         self.size_filter.currentIndexChanged.connect(self._apply_filters)
         self.table.itemSelectionChanged.connect(self._update_bucket_actions_state)
+        self.table.itemDoubleClicked.connect(self._on_table_item_double_clicked)
+        self.folder_back_btn.clicked.connect(self.open_parent_folder)
+        self.download_folder_current_btn.clicked.connect(self.download_current_folder)
         self.copy_share_btn.clicked.connect(self.copy_selected_share_url)
         self.open_share_btn.clicked.connect(self.open_selected_share_url)
 
@@ -833,6 +851,8 @@ class MainWindow(QMainWindow):
         self.download_selected_btn.setObjectName("secondaryBtn")
         self.download_folder_btn.setObjectName("secondaryBtn")
         self.remove_selected_btn.setObjectName("dangerBtn")
+        self.folder_back_btn.setObjectName("secondaryBtn")
+        self.download_folder_current_btn.setObjectName("secondaryBtn")
         self.profile_save_btn.setObjectName("secondaryBtn")
         self.profile_delete_btn.setObjectName("dangerBtn")
         self._configure_hints()
@@ -1285,6 +1305,8 @@ class MainWindow(QMainWindow):
         self.remove_selected_btn.setToolTip("Remove selected rows from upload queue preview.")
         self.download_selected_btn.setToolTip("Download selected files from bucket to a local folder.")
         self.download_folder_btn.setToolTip("Download all files by prefix from bucket.")
+        self.folder_back_btn.setToolTip("Go to parent folder in bucket browser.")
+        self.download_folder_current_btn.setToolTip("Download currently opened folder from bucket.")
         self.pause_btn.setToolTip("Pause current transfer (upload/download).")
         self.resume_btn.setToolTip("Resume paused transfer.")
         self.stop_btn.setToolTip("Stop current transfer.")
@@ -1293,13 +1315,12 @@ class MainWindow(QMainWindow):
         self.profile_delete_btn.setToolTip("Delete selected profile.")
 
     def _polish_tables(self) -> None:
-        sortable = [self.table, self.history_table]
-        for t in [self.queue_table] + sortable:
+        for t in [self.queue_table, self.table, self.history_table]:
             t.verticalHeader().setVisible(False)
             t.setShowGrid(False)
             t.setWordWrap(False)
-        for t in sortable:
-            t.setSortingEnabled(True)
+        self.history_table.setSortingEnabled(True)
+        self.table.setSortingEnabled(False)
 
     def _setup_context_menus(self) -> None:
         self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1398,6 +1419,9 @@ class MainWindow(QMainWindow):
         self._select_row_at_context(self.table, pos)
         selected = self._selected_file_names()
         has_selection = bool(selected)
+        current_item = self.table.item(self.table.currentRow(), 0) if self.table.currentRow() >= 0 else None
+        is_folder_selected = bool(current_item and current_item.data(Qt.UserRole + 1) == "folder")
+        selected_folder = str(current_item.data(Qt.UserRole) or "") if is_folder_selected else ""
 
         menu = QMenu(self)
         act_copy_public = menu.addAction("Copy Public Link")
@@ -1406,11 +1430,12 @@ class MainWindow(QMainWindow):
         act_open_private = menu.addAction("Open Private Link")
         act_preview = menu.addAction("Preview Selected")
         menu.addSeparator()
-        act_download = menu.addAction("Download Selected")
+        act_download = menu.addAction("Download Folder" if is_folder_selected else "Download Selected")
         act_refresh = menu.addAction("Refresh List")
 
-        for action in [act_copy_public, act_open_public, act_copy_private, act_open_private, act_preview, act_download]:
+        for action in [act_copy_public, act_open_public, act_copy_private, act_open_private, act_preview]:
             action.setEnabled(has_selection)
+        act_download.setEnabled(has_selection or is_folder_selected)
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == act_copy_public:
@@ -1424,7 +1449,10 @@ class MainWindow(QMainWindow):
         elif chosen == act_preview:
             self.preview_selected_file()
         elif chosen == act_download:
-            self.download_selected_files()
+            if is_folder_selected and selected_folder:
+                self.download_folder_by_prefix(prefix_override=selected_folder)
+            else:
+                self.download_selected_files()
         elif chosen == act_refresh:
             self.refresh_files()
 
@@ -1884,7 +1912,7 @@ class MainWindow(QMainWindow):
                 100,
                 f"Upload completed | {format_bytes(total_bytes)} / {format_bytes(total_bytes)} uploaded, left 0 B",
             )
-            return self.client.list_files(cfg["bucket_id"], cfg["prefix"])
+            return self.client.list_files_all(cfg["bucket_id"], cfg["prefix"])
 
         def done(files: object) -> None:
             self._fill_table(files)
@@ -1911,7 +1939,7 @@ class MainWindow(QMainWindow):
 
         def task():
             self._ensure_authorized(cfg)
-            return self.client.list_files(cfg["bucket_id"], cfg["prefix"])
+            return self.client.list_files_all(cfg["bucket_id"], cfg["prefix"])
 
         def done(files: object) -> None:
             self._fill_table(files)
@@ -1921,6 +1949,17 @@ class MainWindow(QMainWindow):
 
     def _fill_table(self, files: object) -> None:
         self.file_rows = list(files)
+        cfg = self._current_config()
+        self.base_bucket_prefix = cfg["prefix"].strip("/")
+        if not self.current_folder_prefix:
+            self.current_folder_prefix = self.base_bucket_prefix
+        if self.base_bucket_prefix and not self.current_folder_prefix.startswith(self.base_bucket_prefix):
+            self.current_folder_prefix = self.base_bucket_prefix
+        if not self.base_bucket_prefix and self.current_folder_prefix:
+            current = self.current_folder_prefix.strip("/") + "/"
+            has_current = any(str(r.get("fileName", "")).startswith(current) for r in self.file_rows)
+            if not has_current:
+                self.current_folder_prefix = ""
         self._apply_filters()
 
     def _file_type_matches(self, file_name: str, choice: str) -> bool:
@@ -1956,12 +1995,17 @@ class MainWindow(QMainWindow):
         type_choice = self.type_filter.currentText() if hasattr(self, "type_filter") else "All types"
         size_choice = self.size_filter.currentText() if hasattr(self, "size_filter") else "Any size"
 
+        rows = self._build_browser_rows()
         self.filtered_rows = []
-        for row in self.file_rows:
-            file_name = row.get("fileName", "")
-            size = self._extract_file_size(row)
-            if query and query not in file_name.lower():
+        for row in rows:
+            name = str(row.get("display_name", ""))
+            file_name = str(row.get("fileName", ""))
+            if query and query not in name.lower() and query not in file_name.lower():
                 continue
+            if row.get("kind") == "folder":
+                self.filtered_rows.append(row)
+                continue
+            size = int(row.get("size", 0) or 0)
             if not self._file_type_matches(file_name, type_choice):
                 continue
             if not self._size_filter_matches(size, size_choice):
@@ -1969,25 +2013,111 @@ class MainWindow(QMainWindow):
             self.filtered_rows.append(row)
 
         rows = self.filtered_rows
+        self.browser_rows = rows
         self.table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            file_name = row.get("fileName", "")
-            size = self._extract_file_size(row)
+            file_name = str(row.get("fileName", ""))
+            is_folder = row.get("kind") == "folder"
+            display_name = str(row.get("display_name", file_name))
+            size = int(row.get("size", 0) or 0)
             upload_ts = row.get("uploadTimestamp")
             uploaded = ""
             if upload_ts:
                 uploaded = dt.datetime.fromtimestamp(upload_ts / 1000, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            name_item = QTableWidgetItem(file_name)
-            size_item = QTableWidgetItem(format_bytes(size))
+            name_item = QTableWidgetItem(display_name)
+            name_item.setData(Qt.UserRole, file_name)
+            name_item.setData(Qt.UserRole + 1, row.get("kind"))
+            type_item = QTableWidgetItem("Folder" if is_folder else "File")
+            size_item = QTableWidgetItem("" if is_folder else format_bytes(size))
             size_item.setToolTip(f"{size} bytes")
             uploaded_item = QTableWidgetItem(uploaded)
 
             self.table.setItem(i, 0, name_item)
-            self.table.setItem(i, 1, size_item)
-            self.table.setItem(i, 2, uploaded_item)
-            self.table.setCellWidget(i, 3, self._new_table_preview_button(file_name))
+            self.table.setItem(i, 1, type_item)
+            self.table.setItem(i, 2, size_item)
+            self.table.setItem(i, 3, uploaded_item)
+            self.table.setCellWidget(i, 4, self._new_table_preview_button(file_name, enabled=not is_folder))
+            self.table.setCellWidget(i, 5, self._new_table_download_button(file_name, is_folder))
+        self._update_folder_path_ui()
         self.set_status(f"Loaded {len(self.filtered_rows)} file(s) (filtered)")
+
+    def _build_browser_rows(self) -> List[Dict]:
+        current = self.current_folder_prefix.strip("/")
+        folders: Dict[str, Dict] = {}
+        files: List[Dict] = []
+
+        for row in self.file_rows:
+            file_name = str(row.get("fileName", ""))
+            if not file_name:
+                continue
+            if current:
+                start = current + "/"
+                if not file_name.startswith(start):
+                    continue
+                remainder = file_name[len(start) :]
+            else:
+                remainder = file_name
+            if not remainder:
+                continue
+            if "/" in remainder:
+                folder_name = remainder.split("/", 1)[0]
+                full_prefix = f"{current}/{folder_name}" if current else folder_name
+                folders[full_prefix] = {
+                    "kind": "folder",
+                    "fileName": full_prefix,
+                    "display_name": folder_name,
+                    "size": 0,
+                }
+                continue
+            file_row = dict(row)
+            file_row["kind"] = "file"
+            file_row["display_name"] = remainder
+            file_row["size"] = self._extract_file_size(row)
+            files.append(file_row)
+
+        folder_rows = sorted(folders.values(), key=lambda r: str(r["display_name"]).lower())
+        file_rows = sorted(files, key=lambda r: str(r.get("display_name", "")).lower())
+        return folder_rows + file_rows
+
+    def _update_folder_path_ui(self) -> None:
+        base = self.base_bucket_prefix.strip("/")
+        current = self.current_folder_prefix.strip("/")
+        self.folder_back_btn.setEnabled(bool(current and current != base))
+        self._render_breadcrumbs(base, current)
+
+    def _render_breadcrumbs(self, base: str, current: str) -> None:
+        while self.breadcrumb_layout.count():
+            item = self.breadcrumb_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        root_btn = QPushButton("/")
+        root_btn.setObjectName("secondaryBtn")
+        root_btn.setEnabled(current != base)
+        root_btn.clicked.connect(lambda _=False, p=base: self._open_folder_from_breadcrumb(p))
+        self.breadcrumb_layout.addWidget(root_btn)
+
+        rel = current
+        if base and current.startswith(base):
+            rel = current[len(base) :].lstrip("/")
+        parts = [p for p in rel.split("/") if p]
+
+        path_acc = base
+        for part in parts:
+            self.breadcrumb_layout.addWidget(QLabel(">"))
+            if path_acc:
+                path_acc = f"{path_acc}/{part}"
+            else:
+                path_acc = part
+            crumb = QPushButton(part)
+            crumb.setObjectName("secondaryBtn")
+            crumb.setEnabled(path_acc != current)
+            crumb.clicked.connect(lambda _=False, p=path_acc: self._open_folder_from_breadcrumb(p))
+            self.breadcrumb_layout.addWidget(crumb)
+
+        self.breadcrumb_layout.addStretch(1)
 
     def _extract_file_size(self, row: Dict) -> int:
         # B2 may return size as `size` (list_file_names) or `contentLength` (versions/other APIs).
@@ -2004,25 +2134,27 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 0)
         if not item:
             return None
-        return item.text()
+        kind = item.data(Qt.UserRole + 1)
+        if kind == "folder":
+            return None
+        return str(item.data(Qt.UserRole) or item.text())
 
     def _selected_file_names(self) -> List[str]:
         rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
         result: List[str] = []
         for row in rows:
             item = self.table.item(row, 0)
-            if item and item.text():
-                result.append(item.text())
+            if not item:
+                continue
+            if item.data(Qt.UserRole + 1) == "folder":
+                continue
+            full_name = str(item.data(Qt.UserRole) or item.text())
+            if full_name:
+                result.append(full_name)
         return result
 
     def _copy_text(self, text: str) -> None:
         QApplication.clipboard().setText(text)
-
-    def _selected_file_row(self) -> Optional[Dict]:
-        file_name = self._selected_file_name()
-        if not file_name:
-            return None
-        return next((r for r in self.filtered_rows if r.get("fileName") == file_name), None)
 
     def set_update_repo(self) -> None:
         value, ok = QInputDialog.getText(
@@ -2091,11 +2223,52 @@ class MainWindow(QMainWindow):
             return self.client.make_direct_url(cfg["bucket_name"], file_name, auth_token=token)
         return self.client.make_direct_url(cfg["bucket_name"], file_name)
 
-    def _new_table_preview_button(self, file_name: str) -> QPushButton:
+    def _new_table_preview_button(self, file_name: str, enabled: bool = True) -> QPushButton:
         btn = QPushButton("Preview")
         btn.setObjectName("secondaryBtn")
+        btn.setEnabled(enabled)
         btn.clicked.connect(lambda _=False, name=file_name: self._open_preview_dialog_for_file(name))
         return btn
+
+    def _new_table_download_button(self, file_name: str, is_folder: bool) -> QPushButton:
+        btn = QPushButton("Download")
+        btn.setObjectName("secondaryBtn")
+        if is_folder:
+            btn.clicked.connect(lambda _=False, prefix=file_name: self.download_folder_by_prefix(prefix_override=prefix))
+        else:
+            btn.clicked.connect(lambda _=False, name=file_name: self.download_single_file(name))
+        return btn
+
+    def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        kind = item.data(Qt.UserRole + 1)
+        full_name = str(item.data(Qt.UserRole) or item.text())
+        if kind == "folder":
+            self.open_folder(full_name)
+
+    def open_folder(self, folder_prefix: str) -> None:
+        self.current_folder_prefix = folder_prefix.strip("/")
+        self._apply_filters()
+
+    def _open_folder_from_breadcrumb(self, folder_prefix: str) -> None:
+        self.current_folder_prefix = folder_prefix.strip("/")
+        self._apply_filters()
+
+    def open_parent_folder(self) -> None:
+        current = self.current_folder_prefix.strip("/")
+        base = self.base_bucket_prefix.strip("/")
+        if not current or current == base:
+            return
+        parent = current.rsplit("/", 1)[0] if "/" in current else ""
+        if base and parent and not parent.startswith(base):
+            parent = base
+        self.current_folder_prefix = parent
+        self._apply_filters()
+
+    def download_current_folder(self) -> None:
+        prefix = self.current_folder_prefix.strip("/")
+        self.download_folder_by_prefix(prefix_override=prefix)
 
     def _open_preview_dialog_for_file(self, file_name: str) -> None:
         cfg = self._current_config()
@@ -2359,13 +2532,23 @@ class MainWindow(QMainWindow):
 
         self._download_batch(cfg, selected, destination)
 
-    def download_folder_by_prefix(self) -> None:
+    def download_single_file(self, file_name: str) -> None:
+        cfg = self._current_config()
+        if not cfg["bucket_name"]:
+            QMessageBox.warning(self, "Missing data", "Bucket Name is required.")
+            return
+        destination = QFileDialog.getExistingDirectory(self, "Select destination folder")
+        if not destination:
+            return
+        self._download_batch(cfg, [file_name], destination)
+
+    def download_folder_by_prefix(self, prefix_override: Optional[str] = None) -> None:
         cfg = self._current_config()
         if not cfg["bucket_name"] or not cfg["bucket_id"]:
             QMessageBox.warning(self, "Missing data", "Bucket ID and Bucket Name are required.")
             return
 
-        prefix = cfg["prefix"].strip()
+        prefix = (prefix_override if prefix_override is not None else cfg["prefix"]).strip()
         if not prefix:
             QMessageBox.warning(self, "Missing prefix", "Set folder prefix in the Prefix field (e.g. media/2026/).")
             return
