@@ -47,8 +47,15 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          rm -rf dmg-root
+          mkdir -p dmg-root
+          cp -R "dist/playua-desktop-client.app" "dmg-root/PlayUA Desktop Client.app"
+          ln -s /Applications "dmg-root/Applications"
+          cat > "dmg-root/Install.txt" <<'EOF'
+          Drag "PlayUA Desktop Client.app" to "Applications".
+          EOF
           hdiutil create -volname "PlayUA Desktop Client" \
-            -srcfolder "dist/playua-desktop-client.app" \
+            -srcfolder "dmg-root" \
             -ov -format UDZO "playua-desktop-client-macos.dmg"
 
       - name: Upload artifact (macOS DMG)

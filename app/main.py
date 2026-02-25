@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 
 APP_VERSION = "0.1.0"
-DEFAULT_UPDATE_REPO = "Erleke/backblaze"
+DEFAULT_UPDATE_REPO = "HARd/pu-client"
 APP_USER_MODEL_ID = "PlayUA.Desktop.Client"
 
 
