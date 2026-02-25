@@ -7,13 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = ROOT_DIR / "assets"
 BUILD_ICONS_DIR = ROOT_DIR / "build" / "icons"
 NORMALIZED_PNG = BUILD_ICONS_DIR / "app-icon-1024.png"
+MAC_NORMALIZED_PNG = BUILD_ICONS_DIR / "app-icon-macos-1024.png"
 WIN_ICO = BUILD_ICONS_DIR / "app-icon.ico"
 MAC_ICNS = BUILD_ICONS_DIR / "app-icon.icns"
 
@@ -43,6 +44,28 @@ def normalize_png(source_png: Path) -> None:
         img.save(NORMALIZED_PNG, format="PNG")
 
 
+def build_macos_png() -> None:
+    with Image.open(NORMALIZED_PNG) as img:
+        img = img.convert("RGBA")
+        size = 1024
+        inset = 56
+        inner_size = size - (inset * 2)
+        corner_radius = 220
+
+        inner = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
+
+        mask = Image.new("L", (inner_size, inner_size), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, inner_size - 1, inner_size - 1), radius=corner_radius, fill=255)
+
+        rounded = Image.new("RGBA", (inner_size, inner_size), (0, 0, 0, 0))
+        rounded.paste(inner, (0, 0), mask)
+
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        canvas.paste(rounded, (inset, inset), rounded)
+        canvas.save(MAC_NORMALIZED_PNG, format="PNG")
+
+
 def build_ico() -> None:
     with Image.open(NORMALIZED_PNG) as img:
         img.save(
@@ -68,12 +91,13 @@ def build_icns() -> bool:
         shutil.rmtree(iconset_dir)
     iconset_dir.mkdir(parents=True, exist_ok=True)
 
+    source_for_icns = MAC_NORMALIZED_PNG if MAC_NORMALIZED_PNG.exists() else NORMALIZED_PNG
     icon_sizes = [16, 32, 128, 256, 512]
     for size in icon_sizes:
         out = iconset_dir / f"icon_{size}x{size}.png"
         out2x = iconset_dir / f"icon_{size}x{size}@2x.png"
-        run_cmd(["sips", "-z", str(size), str(size), str(NORMALIZED_PNG), "--out", str(out)])
-        run_cmd(["sips", "-z", str(size * 2), str(size * 2), str(NORMALIZED_PNG), "--out", str(out2x)])
+        run_cmd(["sips", "-z", str(size), str(size), str(source_for_icns), "--out", str(out)])
+        run_cmd(["sips", "-z", str(size * 2), str(size * 2), str(source_for_icns), "--out", str(out2x)])
 
     run_cmd(["iconutil", "-c", "icns", str(iconset_dir), "-o", str(MAC_ICNS)])
     return True
@@ -89,6 +113,7 @@ def main() -> int:
 
     try:
         normalize_png(source_png)
+        build_macos_png()
         build_ico()
         has_icns = build_icns()
     except Exception as exc:

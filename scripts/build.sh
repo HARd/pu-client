@@ -47,6 +47,17 @@ if ! "$PYTHON_BIN" scripts/prepare_icons.py; then
   exit 1
 fi
 
+APP_VER="${APP_VERSION:-}"
+if [[ -z "$APP_VER" ]]; then
+  if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+    APP_VER="$(git describe --tags --abbrev=0 | sed 's/^v//')"
+  else
+    APP_VER="0.1.0"
+  fi
+fi
+mkdir -p build
+printf "%s\n" "$APP_VER" > build/version.txt
+
 ICON_ARG=()
 if [[ -f "build/icons/app-icon.icns" ]]; then
   ICON_ARG=(--icon "build/icons/app-icon.icns")
@@ -57,6 +68,7 @@ fi
   --windowed \
   --noconfirm \
   --add-data "assets/icon.png:assets" \
+  --add-data "build/version.txt:assets" \
   "${ICON_ARG[@]}" \
   app/main.py
 

@@ -7,7 +7,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import subprocess
 import threading
+import tempfile
 import time
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
@@ -49,7 +52,6 @@ from PySide6.QtWidgets import (
 )
 
 
-APP_VERSION = "0.1.0"
 DEFAULT_UPDATE_REPO = "HARd/pu-client"
 APP_USER_MODEL_ID = "PlayUA.Desktop.Client"
 
@@ -78,6 +80,25 @@ def app_root_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
     return Path(__file__).resolve().parent.parent
+
+
+def resolve_app_version() -> str:
+    env_v = os.environ.get("APP_VERSION", "").strip()
+    if env_v:
+        return env_v.lstrip("v")
+    root = app_root_path()
+    for p in [root / "assets" / "version.txt", root / "build" / "version.txt"]:
+        try:
+            if p.exists():
+                raw = p.read_text(encoding="utf-8").strip()
+                if raw:
+                    return raw.lstrip("v")
+        except Exception:
+            continue
+    return "0.1.0"
+
+
+APP_VERSION = resolve_app_version()
 
 
 def resolve_app_icon_path() -> Optional[Path]:
@@ -2210,7 +2231,8 @@ class MainWindow(QMainWindow):
             tag = str(data.get("tag_name", ""))
             html_url = str(data.get("html_url", ""))
             name = str(data.get("name", tag))
-            return {"repo": repo, "tag": tag, "url": html_url, "name": name}
+            assets = data.get("assets", [])
+            return {"repo": repo, "tag": tag, "url": html_url, "name": name, "assets": assets}
 
         def done(result: object) -> None:
             info = dict(result)
@@ -2221,10 +2243,10 @@ class MainWindow(QMainWindow):
                 answer = QMessageBox.question(
                     self,
                     "Update available",
-                    f"Current: v{APP_VERSION}\nLatest: {latest_tag}\n\nOpen release page?",
+                    f"Current: v{APP_VERSION}\nLatest: {latest_tag}\n\nDownload and install update now?",
                 )
                 if answer == QMessageBox.Yes:
-                    QDesktopServices.openUrl(QUrl(str(info["url"])))
+                    self.start_self_update(info)
                 self.set_status(f"Update available: {latest_tag}")
                 return
             QMessageBox.information(
@@ -2235,6 +2257,162 @@ class MainWindow(QMainWindow):
             self.set_status("No updates found")
 
         self._run_bg(task, done)
+
+    def _pick_update_asset(self, info: Dict) -> Optional[Dict]:
+        assets = info.get("assets", [])
+        if not isinstance(assets, list):
+            return None
+        if os.name == "nt":
+            for a in assets:
+                name = str(a.get("name", "")).lower()
+                if name.endswith(".exe"):
+                    return a
+        elif sys.platform == "darwin":
+            for a in assets:
+                name = str(a.get("name", "")).lower()
+                if name.endswith(".dmg"):
+                    return a
+        return None
+
+    def start_self_update(self, info: Dict) -> None:
+        asset = self._pick_update_asset(info)
+        if not asset:
+            QMessageBox.information(
+                self,
+                "Update",
+                "No compatible update asset found for this OS. Opening release page instead.",
+            )
+            if info.get("url"):
+                QDesktopServices.openUrl(QUrl(str(info["url"])))
+            return
+
+        download_url = str(asset.get("browser_download_url", ""))
+        asset_name = str(asset.get("name", "update.bin"))
+        if not download_url:
+            QMessageBox.warning(self, "Update", "Update asset has no download URL.")
+            return
+
+        self.set_status(f"Downloading update: {asset_name} ...")
+
+        def task(progress):
+            target_path = Path(tempfile.gettempdir()) / asset_name
+            with requests.get(download_url, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length", "0") or 0)
+                written = 0
+                with target_path.open("wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        written += len(chunk)
+                        pct = int((written * 100) / max(1, total)) if total else 0
+                        progress(pct, f"Downloading update... {format_bytes(written)}")
+            progress(100, "Update downloaded.")
+            return str(target_path)
+
+        def done(downloaded_path: object) -> None:
+            path = str(downloaded_path)
+            if os.name == "nt":
+                self._install_update_windows(path)
+                return
+            if sys.platform == "darwin":
+                self._install_update_macos(path)
+                return
+            QMessageBox.information(self, "Update", f"Downloaded update to:\n{path}")
+
+        def on_progress(pct: int, text: str) -> None:
+            self.progress_bar.setValue(max(0, min(100, pct)))
+            self.progress_label.setText(text)
+
+        self._run_bg(task, done, on_progress)
+
+    def _install_update_windows(self, downloaded_exe: str) -> None:
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self,
+                "Update downloaded",
+                f"Downloaded updater:\n{downloaded_exe}\n\nRun it manually in dev mode.",
+            )
+            return
+        current_exe = Path(sys.executable)
+        pid = os.getpid()
+        updater_bat = Path(tempfile.gettempdir()) / "playua_update.bat"
+        script = (
+            "@echo off\r\n"
+            f"set PID={pid}\r\n"
+            ":waitloop\r\n"
+            'tasklist /FI "PID eq %PID%" | find "%PID%" >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "  timeout /t 1 /nobreak >nul\r\n"
+            "  goto waitloop\r\n"
+            ")\r\n"
+            f'copy /Y "{downloaded_exe}" "{current_exe}" >nul\r\n'
+            f'start "" "{current_exe}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        updater_bat.write_text(script, encoding="utf-8")
+        subprocess.Popen(["cmd", "/c", str(updater_bat)], creationflags=0x08000000)
+        QMessageBox.information(self, "Updating", "Update downloaded. App will restart now.")
+        QApplication.quit()
+
+    def _install_update_macos(self, downloaded_dmg: str) -> None:
+        if not getattr(sys, "frozen", False):
+            try:
+                subprocess.Popen(["open", downloaded_dmg])
+            except Exception as exc:
+                QMessageBox.warning(self, "Update", f"Failed to open DMG automatically: {exc}")
+                return
+            QMessageBox.information(
+                self,
+                "Update downloaded",
+                "Opened DMG.\nInstall the app from DMG manually in dev mode.",
+            )
+            return
+
+        app_path = Path(sys.executable).resolve().parents[2]
+        target_app = Path("/Applications") / app_path.name
+        if not target_app.parent.exists() or not os.access(str(target_app.parent), os.W_OK):
+            target_app = app_path
+
+        updater_script = Path(tempfile.gettempdir()) / "playua_update_macos.sh"
+        pid = os.getpid()
+        dmg_q = shlex.quote(downloaded_dmg)
+        target_q = shlex.quote(str(target_app))
+        app_q = shlex.quote(str(app_path))
+        script = f"""#!/bin/bash
+set -e
+PID="{pid}"
+DMG={dmg_q}
+TARGET_APP={target_q}
+CURRENT_APP={app_q}
+MOUNTPOINT="$(mktemp -d /tmp/playua_update_mount.XXXXXX)"
+
+while kill -0 "$PID" >/dev/null 2>&1; do
+  sleep 1
+done
+
+hdiutil attach "$DMG" -mountpoint "$MOUNTPOINT" -nobrowse -quiet
+SRC_APP="$(find "$MOUNTPOINT" -maxdepth 1 -type d -name '*.app' | head -n1)"
+if [[ -z "$SRC_APP" ]]; then
+  hdiutil detach "$MOUNTPOINT" -quiet || true
+  exit 1
+fi
+
+rm -rf "$TARGET_APP"
+ditto "$SRC_APP" "$TARGET_APP"
+hdiutil detach "$MOUNTPOINT" -quiet || true
+open "$TARGET_APP"
+"""
+        updater_script.write_text(script, encoding="utf-8")
+        os.chmod(updater_script, 0o755)
+        subprocess.Popen(["/bin/bash", str(updater_script)])
+        QMessageBox.information(
+            self,
+            "Updating",
+            "Update downloaded. App will close now and install the update automatically.",
+        )
+        QApplication.quit()
 
     def _build_preview_url(self, cfg: Dict, file_name: str) -> str:
         # QMediaPlayer can't inject auth headers reliably, so use temporary signed URL if possible.

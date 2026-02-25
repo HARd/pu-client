@@ -41,6 +41,18 @@ if (-not $?) {
   exit 1
 }
 
+$AppVersion = $env:APP_VERSION
+if (-not $AppVersion) {
+  $LatestTag = (& git describe --tags --abbrev=0 2>$null)
+  if ($LASTEXITCODE -eq 0 -and $LatestTag) {
+    $AppVersion = "$LatestTag".TrimStart("v")
+  } else {
+    $AppVersion = "0.1.0"
+  }
+}
+if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
+Set-Content -Path "build\\version.txt" -Value "$AppVersion" -Encoding UTF8
+
 $IconPath = Join-Path $RootDir "build\\icons\\app-icon.ico"
 $PyArgs = @(
   "-m", "PyInstaller",
@@ -48,7 +60,8 @@ $PyArgs = @(
   "--onefile",
   "--windowed",
   "--noconfirm",
-  "--add-data", "assets/icon.png;assets"
+  "--add-data", "assets/icon.png;assets",
+  "--add-data", "build/version.txt;assets"
 )
 if (Test-Path $IconPath) {
   $PyArgs += @("--icon", $IconPath)
