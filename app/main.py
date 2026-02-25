@@ -464,10 +464,27 @@ class PreviewDialog(QDialog):
         self.setWindowTitle(f"Preview: {file_name}")
         self.resize(980, 640)
         self.original_pixmap: Optional[QPixmap] = None
+        self.current_file_name = file_name
 
         layout = QVBoxLayout(self)
         self.status_label = QLabel("Loading preview...")
         layout.addWidget(self.status_label)
+
+        nav_row = QHBoxLayout()
+        self.prev_btn = QPushButton("Previous")
+        self.next_btn = QPushButton("Next")
+        self.download_btn = QPushButton("Download")
+        self.prev_btn.setObjectName("secondaryBtn")
+        self.next_btn.setObjectName("secondaryBtn")
+        self.download_btn.setObjectName("secondaryBtn")
+        self.prev_btn.setMinimumHeight(28)
+        self.next_btn.setMinimumHeight(28)
+        self.download_btn.setMinimumHeight(28)
+        nav_row.addWidget(self.prev_btn)
+        nav_row.addWidget(self.next_btn)
+        nav_row.addStretch(1)
+        nav_row.addWidget(self.download_btn)
+        layout.addLayout(nav_row)
 
         self.image_label = QLabel("")
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -508,6 +525,26 @@ class PreviewDialog(QDialog):
         self.play_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.download_btn.setEnabled(False)
+
+    def set_navigation_handlers(
+        self,
+        prev_cb: Callable[[], None],
+        next_cb: Callable[[], None],
+        download_cb: Callable[[], None],
+    ) -> None:
+        self.prev_btn.clicked.connect(prev_cb)
+        self.next_btn.clicked.connect(next_cb)
+        self.download_btn.clicked.connect(download_cb)
+
+    def set_navigation_state(self, has_prev: bool, has_next: bool) -> None:
+        self.prev_btn.setEnabled(has_prev)
+        self.next_btn.setEnabled(has_next)
+
+    def set_download_enabled(self, enabled: bool) -> None:
+        self.download_btn.setEnabled(enabled)
 
     def _on_position_changed(self, pos: int) -> None:
         if not self.seek.isSliderDown():
@@ -525,11 +562,28 @@ class PreviewDialog(QDialog):
             scaled = self.original_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.image_label.setPixmap(scaled)
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Left and self.prev_btn.isEnabled():
+            self.prev_btn.click()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Right and self.next_btn.isEnabled():
+            self.next_btn.click()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Save) and self.download_btn.isEnabled():
+            self.download_btn.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event) -> None:
         self.player.stop()
         super().closeEvent(event)
 
     def show_image(self, file_name: str, data: bytes) -> None:
+        self.current_file_name = file_name
+        self.setWindowTitle(f"Preview: {file_name}")
         pix = QPixmap()
         if not pix.loadFromData(data):
             self.status_label.setText("Failed to decode image.")
@@ -546,6 +600,8 @@ class PreviewDialog(QDialog):
         self.stop_btn.setEnabled(False)
 
     def show_media(self, file_name: str, media_url: str, is_video: bool) -> None:
+        self.current_file_name = file_name
+        self.setWindowTitle(f"Preview: {file_name}")
         self.original_pixmap = None
         self.image_label.clear()
         self.image_label.setVisible(False)
@@ -2510,30 +2566,71 @@ open "$TARGET_APP"
         self._preview_windows.append(dialog)
         dialog.destroyed.connect(lambda: self._preview_windows.remove(dialog) if dialog in self._preview_windows else None)
         dialog.show()
+        preview_files = self._previewable_file_names()
+        if file_name not in preview_files:
+            preview_files.append(file_name)
+        state = {"idx": max(0, preview_files.index(file_name)), "req": 0}
 
-        def task():
-            self._ensure_authorized(cfg)
-            url = self._build_preview_url(cfg, file_name)
-            if ext in image_ext:
-                resp = requests.get(url, timeout=30)
-                resp.raise_for_status()
-                return {"kind": "image", "data": resp.content, "name": file_name}
-            if ext in video_ext:
-                return {"kind": "video", "url": url, "name": file_name}
-            return {"kind": "audio", "url": url, "name": file_name}
+        def update_nav_state() -> None:
+            idx = int(state["idx"])
+            dialog.set_navigation_state(idx > 0, idx < len(preview_files) - 1)
+            dialog.set_download_enabled(True)
 
-        def done(result: object) -> None:
-            info = dict(result)
-            kind = str(info.get("kind", ""))
-            if kind == "image":
-                dialog.show_image(str(info.get("name", "")), bytes(info.get("data", b"")))
+        def render_current() -> None:
+            current_name = preview_files[int(state["idx"])]
+            current_ext = Path(current_name).suffix.lower()
+            req_id = int(state["req"]) + 1
+            state["req"] = req_id
+            dialog.status_label.setText(f"Loading preview: {current_name}")
+            self._focus_file_in_table(current_name)
+
+            def task():
+                local_cfg = self._current_config()
+                self._ensure_authorized(local_cfg)
+                url = self._build_preview_url(local_cfg, current_name)
+                if current_ext in image_ext:
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    return {"kind": "image", "data": resp.content, "name": current_name, "req": req_id}
+                if current_ext in video_ext:
+                    return {"kind": "video", "url": url, "name": current_name, "req": req_id}
+                return {"kind": "audio", "url": url, "name": current_name, "req": req_id}
+
+            def done(result: object) -> None:
+                info = dict(result)
+                if int(info.get("req", -1)) != int(state["req"]):
+                    return
+                kind = str(info.get("kind", ""))
+                if kind == "image":
+                    dialog.show_image(str(info.get("name", "")), bytes(info.get("data", b"")))
+                    return
+                if kind == "video":
+                    dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=True)
+                    return
+                dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=False)
+
+            self._run_bg(task, done)
+
+        def go_prev() -> None:
+            if int(state["idx"]) <= 0:
                 return
-            if kind == "video":
-                dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=True)
-                return
-            dialog.show_media(str(info.get("name", "")), str(info.get("url", "")), is_video=False)
+            state["idx"] = int(state["idx"]) - 1
+            update_nav_state()
+            render_current()
 
-        self._run_bg(task, done)
+        def go_next() -> None:
+            if int(state["idx"]) >= len(preview_files) - 1:
+                return
+            state["idx"] = int(state["idx"]) + 1
+            update_nav_state()
+            render_current()
+
+        def download_current() -> None:
+            self.download_single_file(preview_files[int(state["idx"])])
+
+        dialog.set_navigation_handlers(go_prev, go_next, download_current)
+        update_nav_state()
+        render_current()
 
     def preview_selected_file(self) -> None:
         file_name = self._selected_file_name()
@@ -2541,6 +2638,33 @@ open "$TARGET_APP"
             QMessageBox.warning(self, "Preview", "Select a file in the Files tab.")
             return
         self._open_preview_dialog_for_file(file_name)
+
+    def _previewable_file_names(self) -> List[str]:
+        image_ext = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+        video_ext = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
+        audio_ext = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"}
+        allowed = image_ext | video_ext | audio_ext
+        names: List[str] = []
+        for row in self.browser_rows:
+            if str(row.get("kind", "")) == "folder":
+                continue
+            full_name = str(row.get("fileName", ""))
+            if not full_name:
+                continue
+            if Path(full_name).suffix.lower() in allowed:
+                names.append(full_name)
+        return names
+
+    def _focus_file_in_table(self, file_name: str) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if not item:
+                continue
+            full_name = str(item.data(Qt.UserRole) or item.text())
+            if full_name == file_name:
+                self.table.selectRow(row)
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                return
 
     def _public_link_task(self, cfg: Dict, file_name: str) -> str:
         self._ensure_authorized(cfg)
