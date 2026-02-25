@@ -114,6 +114,14 @@ def resolve_app_icon_path() -> Optional[Path]:
     return None
 
 
+def should_set_runtime_icon() -> bool:
+    # On macOS bundled apps should use the icon from Info.plist/.icns.
+    # Setting a runtime PNG icon via Qt can override Dock icon styling.
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        return False
+    return True
+
+
 class BackblazeB2Client:
     def __init__(self) -> None:
         self.account_id = None
@@ -559,7 +567,7 @@ class MainWindow(QMainWindow):
         self.resize(1240, 780)
         self.setAcceptDrops(True)
         icon_path = resolve_app_icon_path()
-        if icon_path:
+        if icon_path and should_set_runtime_icon():
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self.client = BackblazeB2Client()
@@ -2429,6 +2437,7 @@ open "$TARGET_APP"
     def _new_table_preview_button(self, file_name: str, enabled: bool = True) -> QPushButton:
         btn = QPushButton("Preview")
         btn.setObjectName("secondaryBtn")
+        self._style_table_action_button(btn, width=84)
         btn.setEnabled(enabled)
         btn.clicked.connect(lambda _=False, name=file_name: self._open_preview_dialog_for_file(name))
         return btn
@@ -2436,11 +2445,19 @@ open "$TARGET_APP"
     def _new_table_download_button(self, file_name: str, is_folder: bool) -> QPushButton:
         btn = QPushButton("Download")
         btn.setObjectName("secondaryBtn")
+        self._style_table_action_button(btn, width=96 if not is_folder else 112)
         if is_folder:
             btn.clicked.connect(lambda _=False, prefix=file_name: self.download_folder_by_prefix(prefix_override=prefix))
         else:
             btn.clicked.connect(lambda _=False, name=file_name: self.download_single_file(name))
         return btn
+
+    def _style_table_action_button(self, btn: QPushButton, width: int) -> None:
+        btn.setMinimumHeight(24)
+        btn.setMaximumHeight(24)
+        btn.setMinimumWidth(width)
+        btn.setMaximumWidth(width)
+        btn.setStyleSheet("padding: 2px 8px; border-radius: 7px; font-size: 12px;")
 
     def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
@@ -2887,7 +2904,7 @@ def run() -> None:
             pass
     app = QApplication([])
     icon_path = resolve_app_icon_path()
-    if icon_path:
+    if icon_path and should_set_runtime_icon():
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()

@@ -48,9 +48,10 @@ def build_macos_png() -> None:
     with Image.open(NORMALIZED_PNG) as img:
         img = img.convert("RGBA")
         size = 1024
-        inset = 56
+        # Larger safe area for a more native macOS Dock appearance.
+        inset = 116
         inner_size = size - (inset * 2)
-        corner_radius = 220
+        corner_radius = 190
 
         inner = img.resize((inner_size, inner_size), Image.Resampling.LANCZOS)
 
