@@ -46,7 +46,8 @@ $PyArgs = @(
   "-m", "PyInstaller",
   "--name", "playua-desktop-client",
   "--windowed",
-  "--noconfirm"
+  "--noconfirm",
+  "--add-data", "assets/icon.png;assets"
 )
 if (Test-Path $IconPath) {
   $PyArgs += @("--icon", $IconPath)

@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import datetime as dt
 import hashlib
 import inspect
@@ -8,12 +9,13 @@ from pathlib import Path
 import re
 import threading
 import time
+import sys
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
 import requests
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
 from PySide6.QtGui import QKeySequence
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -49,6 +51,7 @@ from PySide6.QtWidgets import (
 
 APP_VERSION = "0.1.0"
 DEFAULT_UPDATE_REPO = "Erleke/backblaze"
+APP_USER_MODEL_ID = "PlayUA.Desktop.Client"
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -69,6 +72,25 @@ def parse_semver(tag: str) -> Tuple[int, int, int]:
     if not m:
         return (0, 0, 0)
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def app_root_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_app_icon_path() -> Optional[Path]:
+    root = app_root_path()
+    candidates = [
+        root / "build" / "icons" / "app-icon.ico",
+        root / "assets" / "icon.png",
+        root / "assets" / "app-icon.png",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
 
 class BackblazeB2Client:
@@ -515,6 +537,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PlayUA Desktop Client")
         self.resize(1240, 780)
         self.setAcceptDrops(True)
+        icon_path = resolve_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         self.client = BackblazeB2Client()
         self.settings_store = SettingsStore()
@@ -2677,7 +2702,15 @@ class MainWindow(QMainWindow):
 
 
 def run() -> None:
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
     app = QApplication([])
+    icon_path = resolve_app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
     app.exec()

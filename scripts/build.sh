@@ -56,6 +56,7 @@ fi
   --name playua-desktop-client \
   --windowed \
   --noconfirm \
+  --add-data "assets/icon.png:assets" \
   "${ICON_ARG[@]}" \
   app/main.py
 
