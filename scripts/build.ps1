@@ -45,6 +45,7 @@ $IconPath = Join-Path $RootDir "build\\icons\\app-icon.ico"
 $PyArgs = @(
   "-m", "PyInstaller",
   "--name", "playua-desktop-client",
+  "--onefile",
   "--windowed",
   "--noconfirm",
   "--add-data", "assets/icon.png;assets"

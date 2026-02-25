@@ -43,26 +43,28 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
 
-      - name: Package artifact (macOS)
+      - name: Package artifact (macOS DMG)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          cd dist
-          zip -r ../playua-desktop-client-macos.zip playua-desktop-client.app playua-desktop-client
+          hdiutil create -volname "PlayUA Desktop Client" \
+            -srcfolder "dist/playua-desktop-client.app" \
+            -ov -format UDZO "playua-desktop-client-macos.dmg"
 
-      - name: Package artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\playua-desktop-client\* -DestinationPath playua-desktop-client-windows.zip -Force
-
-      - name: Upload build artifacts
+      - name: Upload artifact (macOS DMG)
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: playua-desktop-client-${{ runner.os }}
-          path: |
-            playua-desktop-client-macos.zip
-            playua-desktop-client-windows.zip
+          name: playua-desktop-client-macOS
+          path: playua-desktop-client-macos.dmg
+          if-no-files-found: error
+
+      - name: Upload artifact (Windows EXE)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playua-desktop-client-Windows
+          path: dist\playua-desktop-client.exe
           if-no-files-found: error
 
   release:
@@ -127,7 +129,7 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            release-assets/**/playua-desktop-client-macos.zip
-            release-assets/**/playua-desktop-client-windows.zip
+            release-assets/**/playua-desktop-client-macos.dmg
+            release-assets/**/playua-desktop-client.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
