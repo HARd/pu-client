@@ -848,8 +848,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Fixed)
+        self.table.setColumnWidth(4, 96)
+        self.table.setColumnWidth(5, 118)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -934,7 +936,7 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self._apply_filters)
         self.type_filter.currentIndexChanged.connect(self._apply_filters)
         self.size_filter.currentIndexChanged.connect(self._apply_filters)
-        self.table.itemSelectionChanged.connect(self._update_bucket_actions_state)
+        self.table.itemSelectionChanged.connect(self._on_files_table_selection_changed)
         self.table.itemDoubleClicked.connect(self._on_table_item_double_clicked)
         self.folder_back_btn.clicked.connect(self.open_parent_folder)
         self.download_folder_current_btn.clicked.connect(self.download_current_folder)
@@ -1397,6 +1399,10 @@ class MainWindow(QMainWindow):
             self.download_btn.style().unpolish(self.download_btn)
             self.download_btn.style().polish(self.download_btn)
             self.download_btn.update()
+
+    def _on_files_table_selection_changed(self) -> None:
+        self._update_bucket_actions_state()
+        self._refresh_table_row_actions()
 
     def _configure_hints(self) -> None:
         self.key_id_input.setPlaceholderText("e.g. 004a7f3f...")
@@ -2147,10 +2153,28 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 1, type_item)
             self.table.setItem(i, 2, size_item)
             self.table.setItem(i, 3, uploaded_item)
-            self.table.setCellWidget(i, 4, self._new_table_preview_button(file_name, enabled=not is_folder))
-            self.table.setCellWidget(i, 5, self._new_table_download_button(file_name, is_folder))
+            self.table.removeCellWidget(i, 4)
+            self.table.removeCellWidget(i, 5)
+        self._refresh_table_row_actions()
         self._update_folder_path_ui()
         self.set_status(f"Loaded {len(self.filtered_rows)} file(s) (filtered)")
+
+    def _refresh_table_row_actions(self) -> None:
+        current_row = self.table.currentRow()
+        for row in range(self.table.rowCount()):
+            self.table.removeCellWidget(row, 4)
+            self.table.removeCellWidget(row, 5)
+            if row != current_row:
+                continue
+            item = self.table.item(row, 0)
+            if not item:
+                continue
+            kind = item.data(Qt.UserRole + 1)
+            file_name = str(item.data(Qt.UserRole) or item.text())
+            is_folder = kind == "folder"
+            if not is_folder:
+                self.table.setCellWidget(row, 4, self._new_table_preview_button(file_name, enabled=True))
+            self.table.setCellWidget(row, 5, self._new_table_download_button(file_name, is_folder))
 
     def _build_browser_rows(self) -> List[Dict]:
         current = self.current_folder_prefix.strip("/")
