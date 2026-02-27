@@ -1076,6 +1076,25 @@ class MainWindow(QMainWindow):
                   background: #ffffff;
                   color: #0f172a;
                 }
+                QMenu {
+                  background: #ffffff;
+                  color: #0f172a;
+                  border: 1px solid #dbe3f0;
+                  padding: 6px;
+                }
+                QMenu::item {
+                  padding: 6px 10px;
+                  border-radius: 6px;
+                }
+                QMenu::item:selected {
+                  background: #e0ecff;
+                  color: #0f172a;
+                }
+                QMenu::separator {
+                  height: 1px;
+                  background: #e2e8f0;
+                  margin: 5px 8px;
+                }
                 QProgressBar {
                   min-height: 18px;
                   border: 1px solid #cbd5e1;
@@ -1189,6 +1208,25 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected {
               background: #141418;
               color: #f8fafc;
+            }
+            QMenu {
+              background: #0f1117;
+              color: #e5e7eb;
+              border: 1px solid #2f3544;
+              padding: 6px;
+            }
+            QMenu::item {
+              padding: 6px 10px;
+              border-radius: 6px;
+            }
+            QMenu::item:selected {
+              background: #1f304d;
+              color: #f8fafc;
+            }
+            QMenu::separator {
+              height: 1px;
+              background: #2f3544;
+              margin: 5px 8px;
             }
             QProgressBar {
               min-height: 18px;
